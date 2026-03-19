@@ -7,23 +7,6 @@ macOS 本地 Shell Agent
 
 启动：
     python3 agent.py
-
-开机自启（launchd）：
-    1. 将下方 plist 保存到 ~/Library/LaunchAgents/com.shellagent.plist
-    2. launchctl load ~/Library/LaunchAgents/com.shellagent.plist
-
-plist 内容：
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict>
-  <key>Label</key><string>com.shellagent</string>
-  <key>ProgramArguments</key>
-  <array><string>/usr/bin/python3</string><string>/path/to/agent.py</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>/tmp/shellagent.log</string>
-  <key>StandardErrorPath</key><string>/tmp/shellagent.err</string>
-</dict></plist>
 """
 
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -40,20 +23,15 @@ import datetime
 import sys
 
 # ─── 配置 ────────────────────────────────────────────────────
-TOKEN = os.getenv("AGENT_TOKEN", "my-secret-token")   # 建议通过环境变量设置
+TOKEN = os.getenv("AGENT_TOKEN", "my-secret-token")
 HOST  = os.getenv("AGENT_HOST", "0.0.0.0")
 PORT  = int(os.getenv("AGENT_PORT", "8000"))
 
-# macOS / Linux 统一使用 utf-8
-OUTPUT_ENCODING = "utf-8"
-
-# 命令黑名单（可按需修改）
+OUTPUT_ENCODING  = "utf-8"
 BLOCKED_KEYWORDS = ["rm -rf /", "rm -rf ~", ":(){ :|:& };:", "mkfs", "dd if="]
 
 # ─── 持久化工作目录 ───────────────────────────────────────────
-# 初始目录设为用户家目录，可访问本机所有有权限的位置
 _cwd = os.path.expanduser("~")
-_cwd_lock = asyncio.Lock() if False else None   # 同步场景不需要锁，占位
 
 
 def get_cwd() -> str:
@@ -62,7 +40,6 @@ def get_cwd() -> str:
 
 def set_cwd(new_path: str):
     global _cwd
-    # 解析绝对路径（处理 ~ 和相对路径）
     expanded = os.path.expanduser(new_path)
     if not os.path.isabs(expanded):
         expanded = os.path.normpath(os.path.join(_cwd, expanded))
@@ -73,11 +50,6 @@ def set_cwd(new_path: str):
 
 
 def resolve_cd(command: str) -> str | None:
-    """
-    从命令字符串中提取 cd 目标路径。
-    仅处理简单 `cd <path>` 形式（不含管道/分号后的 cd）。
-    返回目标路径字符串，或 None（命令不是纯 cd）。
-    """
     stripped = command.strip()
     if stripped in ("cd", "cd ~"):
         return os.path.expanduser("~")
@@ -86,21 +58,68 @@ def resolve_cd(command: str) -> str | None:
     return None
 
 
+# ─── 权限检测 ─────────────────────────────────────────────────
+PERMISSION_ERRORS = [
+    "Operation not permitted",
+    "Permission denied",
+    "operation not permitted",
+    "permission denied",
+]
+
+def is_permission_error(stdout: str, stderr: str) -> bool:
+    combined = stdout + stderr
+    return any(e in combined for e in PERMISSION_ERRORS)
+
+
+def sudo_retry(command: str, timeout: int) -> dict:
+    """
+    用 osascript 弹出系统密码框，以 sudo 权限重新执行命令。
+    返回和普通执行相同结构的 dict。
+    """
+    safe_cmd = command.replace("\\", "\\\\").replace('"', '\\"').replace("'", "'\\''")
+    safe_cwd = _cwd.replace("'", "'\\''")
+
+    # osascript 弹出授权对话框并用 sudo 执行
+    apple_script = f'''
+do shell script "cd '{safe_cwd}' && {safe_cmd}" with administrator privileges
+'''
+    try:
+        result = subprocess.run(
+            ["osascript", "-e", apple_script],
+            capture_output=True,
+            timeout=timeout,
+            encoding=OUTPUT_ENCODING,
+            errors="replace",
+        )
+        return {
+            "stdout":     result.stdout,
+            "stderr":     result.stderr,
+            "returncode": result.returncode,
+            "sudo":       True,
+        }
+    except subprocess.TimeoutExpired:
+        return {"stdout": "", "stderr": "sudo 执行超时", "returncode": 1, "sudo": True}
+    except Exception as e:
+        return {"stdout": "", "stderr": str(e), "returncode": 1, "sudo": True}
+
+
 # ─── App ─────────────────────────────────────────────────────
-app = FastAPI(title="macOS Shell Agent", version="1.1.0")
+app = FastAPI(title="macOS Shell Agent", version="1.2.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # 生产环境请改为具体域名
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # ─── 模型 ─────────────────────────────────────────────────────
 class CmdRequest(BaseModel):
     command: str
-    timeout: int = 30         # 最长执行秒数，默认 30
-    stream: bool = False      # 是否流式返回输出
+    timeout: int = 30
+    stream: bool = False
+    sudo_on_permission_error: bool = False  # 默认由前端弹确认框，确认后再传 True 重试
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────
@@ -120,10 +139,6 @@ def log(level: str, msg: str):
 
 
 def build_command(command: str) -> str:
-    """
-    在命令前注入 cd 到当前持久目录，确保命令在正确的工作目录下执行。
-    同时处理纯 cd 命令：直接更新 _cwd 并返回 echo 确认。
-    """
     cd_target = resolve_cd(command)
     if cd_target is not None:
         ok, resolved = set_cwd(cd_target)
@@ -131,7 +146,6 @@ def build_command(command: str) -> str:
             return f'echo "cwd: {resolved}"'
         else:
             return f'echo "cd: no such directory: {resolved}" >&2; exit 1'
-    # 普通命令：先 cd 到持久目录再执行
     safe_cwd = _cwd.replace("'", "'\\''")
     return f"cd '{safe_cwd}' && {command}"
 
@@ -140,7 +154,6 @@ def build_command(command: str) -> str:
 
 @app.get("/")
 async def health():
-    """健康检查"""
     return {
         "status": "ok",
         "platform": platform.system(),
@@ -154,10 +167,9 @@ async def health():
 async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...)):
     """
     执行 Shell 命令（同步返回）
-
-    请求头：  x-token: <your-token>
-    请求体：  {"command": "ls -la", "timeout": 30}
-    返回：    {"stdout": "...", "stderr": "...", "returncode": 0, "duration_ms": 123, "cwd": "/current/dir"}
+    遇到 Operation not permitted / Permission denied 时：
+      - sudo_on_permission_error=true（默认）→ 弹出系统密码框用 sudo 重试
+      - sudo_on_permission_error=false → 直接返回错误，前端显示授权引导
     """
     check_token(x_token)
     check_blocked(body.command)
@@ -182,23 +194,39 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
         raise HTTPException(status_code=500, detail=str(e))
 
     duration_ms = int((datetime.datetime.now() - start).total_seconds() * 1000)
-    log("INFO", f"done rc={proc.returncode} duration={duration_ms}ms cwd={get_cwd()}")
+
+    # ── 权限错误处理 ─────────────────────────────────────────
+    sudo_used = False
+    if is_permission_error(proc.stdout, proc.stderr) and body.sudo_on_permission_error:
+        log("INFO", f"权限不足，弹出 sudo 授权框重试：{body.command!r}")
+        sudo_result = sudo_retry(body.command, body.timeout)
+        stdout     = sudo_result["stdout"]
+        stderr     = sudo_result["stderr"]
+        returncode = sudo_result["returncode"]
+        sudo_used  = True
+    else:
+        stdout     = proc.stdout
+        stderr     = proc.stderr
+        returncode = proc.returncode
+
+    log("INFO", f"done rc={returncode} duration={duration_ms}ms sudo={sudo_used}")
 
     return {
-        "stdout":      proc.stdout,
-        "stderr":      proc.stderr,
-        "returncode":  proc.returncode,
+        "stdout":      stdout,
+        "stderr":      stderr,
+        "returncode":  returncode,
         "duration_ms": duration_ms,
         "command":     body.command,
-        "cwd":         get_cwd(),       # 返回当前目录，方便前端展示
+        "cwd":         get_cwd(),
+        "sudo_used":   sudo_used,
+        # 权限错误且未 sudo 时通知前端展示引导
+        "permission_error": is_permission_error(stdout, stderr) and not sudo_used,
     }
 
 
 @app.post("/exec/stream")
 async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(...)):
-    """
-    执行 Shell 命令（流式返回，Server-Sent Events）
-    """
+    """流式执行，权限错误时在流末尾附加 permission_error 标记"""
     check_token(x_token)
     check_blocked(body.command)
 
@@ -212,15 +240,29 @@ async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
+        output_buf = []
         try:
             async for raw_line in proc.stdout:
-                try:
-                    line = raw_line.decode(OUTPUT_ENCODING, errors="replace")
-                except Exception:
-                    line = raw_line.decode("utf-8", errors="replace")
+                line = raw_line.decode(OUTPUT_ENCODING, errors="replace")
+                output_buf.append(line)
                 yield f"data: {json.dumps({'line': line})}\n\n"
             await proc.wait()
-            yield f"data: {json.dumps({'done': True, 'returncode': proc.returncode, 'cwd': get_cwd()})}\n\n"
+
+            combined = "".join(output_buf)
+            perm_err = is_permission_error(combined, "")
+
+            # 流式模式下权限错误：用 osascript sudo 重试，把结果追加输出
+            if perm_err and body.sudo_on_permission_error:
+                yield f"data: {json.dumps({'line': '\n[权限不足，正在弹出授权框...]\n'})}\n\n"
+                sudo_result = sudo_retry(body.command, body.timeout)
+                if sudo_result["stdout"]:
+                    yield f"data: {json.dumps({'line': sudo_result['stdout']})}\n\n"
+                if sudo_result["stderr"]:
+                    yield f"data: {json.dumps({'line': sudo_result['stderr']})}\n\n"
+                yield f"data: {json.dumps({'done': True, 'returncode': sudo_result['returncode'], 'cwd': get_cwd(), 'sudo_used': True})}\n\n"
+            else:
+                yield f"data: {json.dumps({'done': True, 'returncode': proc.returncode, 'cwd': get_cwd(), 'sudo_used': False, 'permission_error': perm_err})}\n\n"
+
         except asyncio.CancelledError:
             proc.kill()
 
@@ -229,18 +271,12 @@ async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(
 
 @app.get("/cwd")
 async def get_current_dir(x_token: str = Header(...)):
-    """返回当前持久工作目录"""
     check_token(x_token)
     return {"cwd": get_cwd()}
 
 
 @app.post("/cwd")
 async def set_current_dir(request: Request, x_token: str = Header(...)):
-    """
-    手动设置工作目录
-
-    请求体：{"path": "/Users/you/projects"}
-    """
     check_token(x_token)
     body = await request.json()
     path = body.get("path", "")
@@ -250,9 +286,44 @@ async def set_current_dir(request: Request, x_token: str = Header(...)):
     return {"cwd": resolved}
 
 
+@app.get("/grant-access")
+async def grant_access(x_token: str = Header(...)):
+    """
+    引导用户开启终端完整磁盘访问权限。
+    直接用 osascript 打开系统偏好设置到对应页面。
+    """
+    check_token(x_token)
+    script = '''
+tell application "System Preferences"
+    activate
+    set current pane to pane "com.apple.preference.security"
+end tell
+delay 0.5
+tell application "System Events"
+    tell process "System Preferences"
+        click button "隐私" of tab group 1 of window 1
+    end tell
+end tell
+'''
+    try:
+        subprocess.Popen(["osascript", "-e", script])
+    except Exception:
+        # 回退：直接 open 系统设置 URL
+        subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"])
+
+    return {
+        "message": "已打开系统设置 → 隐私与安全性，请将你的终端或 ShellAgent 加入「完整磁盘访问权限」",
+        "steps": [
+            "1. 在打开的窗口中找到「完整磁盘访问权限」",
+            "2. 点击左下角锁图标解锁",
+            "3. 点击 + 添加 ShellAgent 或你的终端 App",
+            "4. 重启 ShellAgent 服务",
+        ]
+    }
+
+
 @app.get("/info")
 async def system_info(x_token: str = Header(...)):
-    """返回本机基本系统信息"""
     check_token(x_token)
     proc = subprocess.run(
         "system_profiler SPSoftwareDataType SPHardwareDataType",
@@ -274,4 +345,8 @@ if __name__ == "__main__":
     log("INFO", f"Shell Agent starting on {HOST}:{PORT}")
     log("INFO", f"Token: {TOKEN[:4]}{'*' * (len(TOKEN)-4)}")
     log("INFO", f"Initial cwd: {get_cwd()}")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    # 兼容 PyDev 调试器：手动创建 uvicorn server 而不使用 loop_factory
+    import uvicorn.config
+    config = uvicorn.config.Config(app, host=HOST, port=PORT, log_level="warning")
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())

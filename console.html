@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Shell Agent Console</title>
+<title>Shell Agent Console v1.2.0</title>
 <style>
   @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap');
 
@@ -144,6 +144,78 @@
   .entry-output.err { border-left-color: var(--red); }
   .entry-output.streaming { border-left-color: var(--amber); }
   .entry-output .stderr-line { color: var(--red); }
+
+  /* ── 权限错误提示 ── */
+  .perm-banner {
+    margin-top: 10px;
+    background: #ffb70018;
+    border: 1px solid var(--amber);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--amber);
+    line-height: 1.8;
+  }
+  .perm-banner .perm-title { font-weight: 600; margin-bottom: 2px; }
+  .perm-banner .perm-steps { color: var(--text2); margin: 4px 0 8px; }
+  .perm-btn {
+    display: inline-block;
+    padding: 5px 14px;
+    background: #ffb70022;
+    border: 1px solid var(--amber);
+    border-radius: 6px;
+    color: var(--amber);
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 700;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .perm-btn:hover { background: #ffb70044; }
+
+  /* ── 授权确认弹窗 ── */
+  .modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.55);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 999;
+    animation: fadeIn .15s ease;
+  }
+  @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+  .modal {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 24px 28px;
+    width: 360px;
+    box-shadow: 0 8px 32px rgba(0,0,0,.4);
+  }
+  .modal-icon  { font-size: 28px; margin-bottom: 10px; }
+  .modal-title { font-family: var(--sans); font-size: 15px; font-weight: 700; color: var(--text); margin-bottom: 8px; }
+  .modal-body  { font-family: var(--mono); font-size: 12px; color: var(--text2); line-height: 1.7; margin-bottom: 20px; }
+  .modal-cmd   { color: var(--amber); word-break: break-all; }
+  .modal-btns  { display: flex; gap: 10px; justify-content: flex-end; }
+  .modal-cancel {
+    padding: 7px 18px;
+    background: transparent;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text2);
+    font-family: var(--sans); font-size: 12px; font-weight: 700;
+    cursor: pointer; transition: border-color .15s;
+  }
+  .modal-cancel:hover { border-color: var(--text2); }
+  .modal-confirm {
+    padding: 7px 18px;
+    background: #ffb70022;
+    border: 1px solid var(--amber);
+    border-radius: 6px;
+    color: var(--amber);
+    font-family: var(--sans); font-size: 12px; font-weight: 700;
+    cursor: pointer; transition: background .15s;
+  }
+  .modal-confirm:hover { background: #ffb70044; }
 
   /* ── Skeleton loader ── */
   .skeleton {
@@ -292,6 +364,7 @@
     <div class="logo">
       <div class="logo-dot"></div>
       SHELL AGENT
+      <span style="font-size:10px;font-weight:400;color:var(--muted);letter-spacing:.03em;margin-left:4px">v1.2.0</span>
     </div>
     <div class="conn-row">
       <input id="agent-url"   placeholder="http://192.168.1.100:8000" value="http://localhost:8000">
@@ -504,6 +577,15 @@
     if (data.stdout) html += escHtml(data.stdout);
     if (data.stderr)  html += `<span class="stderr-line">${escHtml(data.stderr)}</span>`;
     if (!html)        html = '<span style="color:var(--muted)">(no output)</span>';
+
+    // sudo 成功提示
+    if (data.sudo_used) {
+      html += `\n<span style="color:var(--amber);font-size:11px">⚡ 已通过授权以管理员权限执行</span>`;
+    }
+    // 权限错误引导
+    if (data.permission_error) {
+      html += showPermissionError(url, token, cmd, out, meta);
+    }
     out.innerHTML = html;
 
     meta.innerHTML =
@@ -551,6 +633,12 @@
           if (obj.done) {
             rc = obj.returncode;
             if (obj.cwd) updateCwd(obj.cwd);
+            if (obj.sudo_used) {
+              out.textContent += '\n⚡ 已通过授权以管理员权限执行';
+            }
+            if (obj.permission_error) {
+              out.insertAdjacentHTML('beforeend', showPermissionError(url, token, cmd, out, meta));
+            }
           } else if (obj.line != null) {
             out.textContent += obj.line;
             scrollBottom();
@@ -570,6 +658,104 @@
   }
 
   cmdInput.focus();
+
+  // ── 权限错误引导 ────────────────────────────────────────────
+  // ── 权限错误：弹窗确认 → sudo 重试 ──────────────────────────
+  function showPermissionError(url, token, cmd, out, meta) {
+    // 先在输出框下方显示提示横幅
+    const banner = `<div class="perm-banner">
+      <div class="perm-title">⚠ 权限不足（Operation not permitted）</div>
+      <div class="perm-steps">此操作需要管理员权限</div>
+      <span class="perm-btn" onclick="confirmSudo('${escHtml(url)}','${escHtml(token)}','${escHtml(cmd)}')">
+        🔑 授权并重试
+      </span>
+      &nbsp;
+      <span class="perm-btn" onclick="grantAccess('${escHtml(url)}','${escHtml(token)}')">
+        🔓 开启磁盘访问权限
+      </span>
+    </div>`;
+    return banner;
+  }
+
+  // 弹出确认 modal，用户点确认后以 sudo 重试
+  function confirmSudo(url, token, cmd) {
+    // 创建 modal
+    const overlay = document.createElement('div');
+    overlay.className = 'modal-overlay';
+    overlay.innerHTML = `
+      <div class="modal">
+        <div class="modal-icon">🔑</div>
+        <div class="modal-title">需要管理员权限</div>
+        <div class="modal-body">
+          以下命令遇到权限限制：<br>
+          <span class="modal-cmd">${escHtml(cmd)}</span><br><br>
+          点击「授权执行」后，macOS 将弹出系统密码框，
+          输入密码后以管理员权限重新执行。
+        </div>
+        <div class="modal-btns">
+          <button class="modal-cancel" onclick="this.closest('.modal-overlay').remove()">取消</button>
+          <button class="modal-confirm" onclick="doSudoRetry('${escHtml(url)}','${escHtml(token)}','${escHtml(cmd)}',this)">
+            授权执行
+          </button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    // 点遮罩关闭
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  }
+
+  // 确认后以 sudo_on_permission_error=true 重新发请求
+  async function doSudoRetry(url, token, cmd, btn) {
+    btn.disabled = true;
+    btn.textContent = '执行中...';
+    const overlay = btn.closest('.modal-overlay');
+
+    try {
+      const res = await fetch(`${url}/exec`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-token': token },
+        body: JSON.stringify({ command: cmd, timeout: 60, sudo_on_permission_error: true }),
+      });
+      overlay.remove();
+
+      const data = await res.json();
+      // 找到最后一个 entry 的 out 元素更新结果
+      const entries = document.querySelectorAll('.entry');
+      const lastOut  = entries[entries.length - 1]?.querySelector('.entry-output');
+      const lastMeta = entries[entries.length - 1]?.querySelector('.entry-meta');
+      if (!lastOut) return;
+
+      const rc = data.returncode;
+      lastOut.className = `entry-output ${rc === 0 ? 'ok' : 'err'}`;
+      let html = '';
+      if (data.stdout) html += escHtml(data.stdout);
+      if (data.stderr)  html += `<span class="stderr-line">${escHtml(data.stderr)}</span>`;
+      if (!html)        html = '<span style="color:var(--muted)">(no output)</span>';
+      if (data.sudo_used) html += `\n<span style="color:var(--amber);font-size:11px">⚡ 已通过授权以管理员权限执行</span>`;
+      if (data.permission_error) html += showPermissionError(url, token, cmd);
+      lastOut.innerHTML = html;
+
+      if (lastMeta) {
+        lastMeta.innerHTML =
+          `rc=<span class="${rc===0?'rc-ok':'rc-err'}">${rc}</span>` +
+          ` &nbsp; sudo &nbsp; ${new Date().toLocaleTimeString()}`;
+      }
+      if (data.cwd) updateCwd(data.cwd);
+      scrollBottom();
+    } catch (e) {
+      overlay.remove();
+      alert('请求失败：' + e.message);
+    }
+  }
+
+  // 打开系统设置完整磁盘访问权限页面
+  async function grantAccess(url, token) {
+    try {
+      await fetch(`${url}/grant-access`, { headers: { 'x-token': token } });
+    } catch (_) {
+      window.open('x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles');
+    }
+  }
 </script>
 </body>
 </html>
