@@ -29,7 +29,6 @@
 
   html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); }
 
-  /* ── Layout ── */
   .shell {
     display: grid;
     grid-template-rows: 56px 1fr auto;
@@ -105,7 +104,13 @@
     font-family: var(--mono);
     font-size: 13px;
   }
-  .prompt { color: var(--green); flex-shrink: 0; }
+  .entry-cmd .prompt-path {
+    color: var(--blue);
+    flex-shrink: 0;
+    font-size: 12px;
+    opacity: .85;
+  }
+  .entry-cmd .prompt-arrow { color: var(--green); flex-shrink: 0; }
   .entry-cmd .cmd-text { color: #e8eaf6; word-break: break-all; }
 
   .entry-meta {
@@ -138,7 +143,6 @@
   .entry-output.ok  { border-left-color: var(--green); }
   .entry-output.err { border-left-color: var(--red); }
   .entry-output.streaming { border-left-color: var(--amber); }
-
   .entry-output .stderr-line { color: var(--red); }
 
   /* ── Skeleton loader ── */
@@ -172,6 +176,20 @@
     gap: 10px;
   }
 
+  /* cwd 显示条 */
+  .cwd-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text2);
+    padding: 0 2px;
+  }
+  .cwd-bar .cwd-label { color: var(--muted); }
+  .cwd-bar .cwd-path  { color: var(--blue); }
+  .cwd-bar .cwd-sep   { color: var(--border); }
+
   .input-row {
     display: flex;
     align-items: center;
@@ -183,7 +201,7 @@
     transition: border-color .2s;
   }
   .input-row:focus-within { border-color: var(--green); }
-  .input-row .prompt { font-family: var(--mono); font-size: 14px; }
+  .input-row .prompt { font-family: var(--mono); font-size: 14px; color: var(--green); }
 
   #cmd-input {
     flex: 1;
@@ -255,6 +273,7 @@
     font-size: 11px;
     color: var(--muted);
     font-family: var(--mono);
+    margin-left: auto;
   }
   kbd {
     background: var(--bg3);
@@ -286,15 +305,23 @@
       <div class="hi">// Shell Agent Console</div>
       <div>连接到远程 macOS 主机，在下方输入命令后按 Enter 执行。</div>
       <div>支持流式输出（适合 ping / 编译等长命令），使用 zsh 执行。</div>
+      <div>支持 <span style="color:var(--green)">cd</span> 跨命令保持目录状态，初始目录为 <span style="color:var(--blue)">~</span>。</div>
       <div style="color:var(--amber)">⚠  请确保 Token 正确，并仅在受信网络中使用。</div>
     </div>
   </div>
 
   <!-- Input bar -->
   <div class="input-bar">
+    <!-- 当前目录展示 -->
+    <div class="cwd-bar">
+      <span class="cwd-label">cwd</span>
+      <span class="cwd-sep">›</span>
+      <span class="cwd-path" id="cwd-display">~</span>
+    </div>
+
     <div class="input-row">
-      <span class="prompt" style="color:var(--green)">❯</span>
-      <input id="cmd-input" placeholder="输入 Shell 命令，如 ifconfig / ls -la / top -l 1" autocomplete="off" spellcheck="false">
+      <span class="prompt">❯</span>
+      <input id="cmd-input" placeholder="输入 Shell 命令，如 cd /tmp / ls -la / find . -name '*.py'" autocomplete="off" spellcheck="false">
       <button class="btn" id="run-btn" onclick="runCmd()">RUN</button>
       <button class="btn danger" onclick="clearOutput()">CLR</button>
     </div>
@@ -316,9 +343,33 @@
   const outputEl  = document.getElementById('output');
   const cmdInput  = document.getElementById('cmd-input');
   const runBtn    = document.getElementById('run-btn');
+  const cwdDisplay = document.getElementById('cwd-display');
 
   let history = [];
   let histIdx  = -1;
+
+  // ── 更新 cwd 显示（将 /Users/xxx 缩短为 ~/xxx）──────────────
+  function updateCwd(path) {
+    if (!path) return;
+    // 尝试把 /Users/<name> 或 /home/<name> 替换为 ~
+    const shortened = path.replace(/^\/(?:Users|home)\/[^/]+/, '~');
+    cwdDisplay.textContent = shortened;
+    cwdDisplay.title = path;  // hover 显示完整路径
+  }
+
+  // 启动时拉取当前 cwd
+  async function fetchInitialCwd() {
+    const url   = document.getElementById('agent-url').value.trim().replace(/\/$/, '');
+    const token = document.getElementById('agent-token').value.trim();
+    try {
+      const res = await fetch(`${url}/cwd`, { headers: { 'x-token': token } });
+      if (res.ok) {
+        const data = await res.json();
+        updateCwd(data.cwd);
+      }
+    } catch (_) {}
+  }
+  fetchInitialCwd();
 
   // ── 键盘：Enter 执行，↑↓ 历史 ──────────────────────────────
   cmdInput.addEventListener('keydown', e => {
@@ -336,15 +387,9 @@
     }
   });
 
-  // ── 清空 ───────────────────────────────────────────────────
-  function clearOutput() {
-    outputEl.innerHTML = '';
-  }
+  function clearOutput() { outputEl.innerHTML = ''; }
 
-  // ── 滚到底 ─────────────────────────────────────────────────
-  function scrollBottom() {
-    outputEl.scrollTop = outputEl.scrollHeight;
-  }
+  function scrollBottom() { outputEl.scrollTop = outputEl.scrollHeight; }
 
   // ── 创建 Entry DOM ──────────────────────────────────────────
   function createEntry(cmd) {
@@ -353,7 +398,22 @@
 
     const cmdRow = document.createElement('div');
     cmdRow.className = 'entry-cmd';
-    cmdRow.innerHTML = `<span class="prompt">❯</span><span class="cmd-text">${escHtml(cmd)}</span>`;
+
+    const pathSpan = document.createElement('span');
+    pathSpan.className = 'prompt-path';
+    pathSpan.textContent = cwdDisplay.textContent;
+
+    const arrowSpan = document.createElement('span');
+    arrowSpan.className = 'prompt-arrow';
+    arrowSpan.textContent = ' ❯';
+
+    const cmdText = document.createElement('span');
+    cmdText.className = 'cmd-text';
+    cmdText.textContent = cmd;
+
+    cmdRow.appendChild(pathSpan);
+    cmdRow.appendChild(arrowSpan);
+    cmdRow.appendChild(cmdText);
 
     const meta = document.createElement('div');
     meta.className = 'entry-meta';
@@ -370,7 +430,6 @@
     return { entry, meta, out };
   }
 
-  // ── 骨架加载动画 ────────────────────────────────────────────
   function showSkeleton(el) {
     el.innerHTML = [70, 90, 55].map(w =>
       `<div class="skeleton" style="width:${w}%"></div>`
@@ -387,10 +446,9 @@
     if (!cmd) return;
     const url   = document.getElementById('agent-url').value.trim().replace(/\/$/, '');
     const token = document.getElementById('agent-token').value.trim();
-    const stream = document.getElementById('stream-toggle').checked;
+    const stream  = document.getElementById('stream-toggle').checked;
     const timeout = parseInt(document.getElementById('timeout-val').value) || 30;
 
-    // 历史
     history.unshift(cmd);
     histIdx = -1;
     cmdInput.value = '';
@@ -435,6 +493,9 @@
       return;
     }
 
+    // 更新 cwd 显示
+    if (data.cwd) updateCwd(data.cwd);
+
     const rc  = data.returncode;
     const dur = data.duration_ms ?? elapsed;
     out.className = `entry-output ${rc === 0 ? 'ok' : 'err'}`;
@@ -447,7 +508,8 @@
 
     meta.innerHTML =
       `rc=<span class="${rc===0?'rc-ok':'rc-err'}">${rc}</span>` +
-      ` &nbsp; ${dur}ms &nbsp; ${new Date().toLocaleTimeString()}`;
+      ` &nbsp; ${dur}ms &nbsp; ${new Date().toLocaleTimeString()}` +
+      (data.cwd ? ` &nbsp; <span style="color:var(--blue)">${escHtml(data.cwd.replace(/^\/(?:Users|home)\/[^/]+/, '~'))}</span>` : '');
   }
 
   // ── 流式执行（SSE）──────────────────────────────────────────
@@ -480,7 +542,7 @@
       if (done) break;
       buf += decoder.decode(value, { stream: true });
       const lines = buf.split('\n');
-      buf = lines.pop();   // 保留未完整行
+      buf = lines.pop();
 
       for (const line of lines) {
         if (!line.startsWith('data: ')) continue;
@@ -488,6 +550,7 @@
           const obj = JSON.parse(line.slice(6));
           if (obj.done) {
             rc = obj.returncode;
+            if (obj.cwd) updateCwd(obj.cwd);
           } else if (obj.line != null) {
             out.textContent += obj.line;
             scrollBottom();
@@ -498,13 +561,14 @@
 
     out.className = `entry-output ${(rc ?? 0) === 0 ? 'ok' : 'err'}`;
     if (rc !== null) {
+      const shortCwd = cwdDisplay.textContent;
       meta.innerHTML =
         `rc=<span class="${rc===0?'rc-ok':'rc-err'}">${rc}</span>` +
-        ` &nbsp; stream &nbsp; ${new Date().toLocaleTimeString()}`;
+        ` &nbsp; stream &nbsp; ${new Date().toLocaleTimeString()}` +
+        ` &nbsp; <span style="color:var(--blue)">${escHtml(shortCwd)}</span>`;
     }
   }
 
-  // 自动聚焦
   cmdInput.focus();
 </script>
 </body>

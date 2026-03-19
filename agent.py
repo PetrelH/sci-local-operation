@@ -50,8 +50,44 @@ OUTPUT_ENCODING = "utf-8"
 # 命令黑名单（可按需修改）
 BLOCKED_KEYWORDS = ["rm -rf /", "rm -rf ~", ":(){ :|:& };:", "mkfs", "dd if="]
 
+# ─── 持久化工作目录 ───────────────────────────────────────────
+# 初始目录设为用户家目录，可访问本机所有有权限的位置
+_cwd = os.path.expanduser("~")
+_cwd_lock = asyncio.Lock() if False else None   # 同步场景不需要锁，占位
+
+
+def get_cwd() -> str:
+    return _cwd
+
+
+def set_cwd(new_path: str):
+    global _cwd
+    # 解析绝对路径（处理 ~ 和相对路径）
+    expanded = os.path.expanduser(new_path)
+    if not os.path.isabs(expanded):
+        expanded = os.path.normpath(os.path.join(_cwd, expanded))
+    if os.path.isdir(expanded):
+        _cwd = expanded
+        return True, expanded
+    return False, expanded
+
+
+def resolve_cd(command: str) -> str | None:
+    """
+    从命令字符串中提取 cd 目标路径。
+    仅处理简单 `cd <path>` 形式（不含管道/分号后的 cd）。
+    返回目标路径字符串，或 None（命令不是纯 cd）。
+    """
+    stripped = command.strip()
+    if stripped in ("cd", "cd ~"):
+        return os.path.expanduser("~")
+    if stripped.startswith("cd ") and ";" not in stripped and "|" not in stripped and "&&" not in stripped:
+        return stripped[3:].strip().strip('"').strip("'")
+    return None
+
+
 # ─── App ─────────────────────────────────────────────────────
-app = FastAPI(title="macOS Shell Agent", version="1.0.0")
+app = FastAPI(title="macOS Shell Agent", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,6 +119,23 @@ def log(level: str, msg: str):
     print(f"[{ts}] [{level}] {msg}", flush=True)
 
 
+def build_command(command: str) -> str:
+    """
+    在命令前注入 cd 到当前持久目录，确保命令在正确的工作目录下执行。
+    同时处理纯 cd 命令：直接更新 _cwd 并返回 echo 确认。
+    """
+    cd_target = resolve_cd(command)
+    if cd_target is not None:
+        ok, resolved = set_cwd(cd_target)
+        if ok:
+            return f'echo "cwd: {resolved}"'
+        else:
+            return f'echo "cd: no such directory: {resolved}" >&2; exit 1'
+    # 普通命令：先 cd 到持久目录再执行
+    safe_cwd = _cwd.replace("'", "'\\''")
+    return f"cd '{safe_cwd}' && {command}"
+
+
 # ─── 路由 ─────────────────────────────────────────────────────
 
 @app.get("/")
@@ -93,6 +146,7 @@ async def health():
         "platform": platform.system(),
         "python": sys.version,
         "time": datetime.datetime.now().isoformat(),
+        "cwd": get_cwd(),
     }
 
 
@@ -102,20 +156,21 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
     执行 Shell 命令（同步返回）
 
     请求头：  x-token: <your-token>
-    请求体：  {"command": "ipconfig", "timeout": 30}
-    返回：    {"stdout": "...", "stderr": "...", "returncode": 0, "duration_ms": 123}
+    请求体：  {"command": "ls -la", "timeout": 30}
+    返回：    {"stdout": "...", "stderr": "...", "returncode": 0, "duration_ms": 123, "cwd": "/current/dir"}
     """
     check_token(x_token)
     check_blocked(body.command)
 
-    log("INFO", f"[{request.client.host}] exec: {body.command!r}")
+    actual_command = build_command(body.command)
+    log("INFO", f"[{request.client.host}] exec: {body.command!r}  (cwd={get_cwd()})")
     start = datetime.datetime.now()
 
     try:
         proc = subprocess.run(
-            body.command,
+            actual_command,
             shell=True,
-            executable="/bin/zsh",   # macOS 默认 shell
+            executable="/bin/zsh",
             capture_output=True,
             timeout=body.timeout,
             encoding=OUTPUT_ENCODING,
@@ -127,7 +182,7 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
         raise HTTPException(status_code=500, detail=str(e))
 
     duration_ms = int((datetime.datetime.now() - start).total_seconds() * 1000)
-    log("INFO", f"done rc={proc.returncode} duration={duration_ms}ms")
+    log("INFO", f"done rc={proc.returncode} duration={duration_ms}ms cwd={get_cwd()}")
 
     return {
         "stdout":      proc.stdout,
@@ -135,6 +190,7 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
         "returncode":  proc.returncode,
         "duration_ms": duration_ms,
         "command":     body.command,
+        "cwd":         get_cwd(),       # 返回当前目录，方便前端展示
     }
 
 
@@ -142,20 +198,17 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
 async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(...)):
     """
     执行 Shell 命令（流式返回，Server-Sent Events）
-
-    每行输出实时推送，适合长时间运行的命令（如 ping、编译等）
-
-    前端接收示例：
-        const es = new EventSource(...)  // 或用 fetch + ReadableStream
     """
     check_token(x_token)
     check_blocked(body.command)
-    log("INFO", f"[{request.client.host}] stream: {body.command!r}")
+
+    actual_command = build_command(body.command)
+    log("INFO", f"[{request.client.host}] stream: {body.command!r}  (cwd={get_cwd()})")
 
     async def generate():
         proc = await asyncio.create_subprocess_shell(
-            body.command,
-            executable="/bin/zsh",   # macOS 默认 shell
+            actual_command,
+            executable="/bin/zsh",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
@@ -167,11 +220,34 @@ async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(
                     line = raw_line.decode("utf-8", errors="replace")
                 yield f"data: {json.dumps({'line': line})}\n\n"
             await proc.wait()
-            yield f"data: {json.dumps({'done': True, 'returncode': proc.returncode})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'returncode': proc.returncode, 'cwd': get_cwd()})}\n\n"
         except asyncio.CancelledError:
             proc.kill()
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@app.get("/cwd")
+async def get_current_dir(x_token: str = Header(...)):
+    """返回当前持久工作目录"""
+    check_token(x_token)
+    return {"cwd": get_cwd()}
+
+
+@app.post("/cwd")
+async def set_current_dir(request: Request, x_token: str = Header(...)):
+    """
+    手动设置工作目录
+
+    请求体：{"path": "/Users/you/projects"}
+    """
+    check_token(x_token)
+    body = await request.json()
+    path = body.get("path", "")
+    ok, resolved = set_cwd(path)
+    if not ok:
+        raise HTTPException(status_code=400, detail=f"Directory not found: {resolved}")
+    return {"cwd": resolved}
 
 
 @app.get("/info")
@@ -188,7 +264,8 @@ async def system_info(x_token: str = Header(...)):
         "node":       platform.node(),
         "release":    platform.release(),
         "processor":  platform.processor(),
-        "raw_output": proc.stdout[:2000],   # 截断防止过长
+        "cwd":        get_cwd(),
+        "raw_output": proc.stdout[:2000],
     }
 
 
@@ -196,4 +273,5 @@ async def system_info(x_token: str = Header(...)):
 if __name__ == "__main__":
     log("INFO", f"Shell Agent starting on {HOST}:{PORT}")
     log("INFO", f"Token: {TOKEN[:4]}{'*' * (len(TOKEN)-4)}")
+    log("INFO", f"Initial cwd: {get_cwd()}")
     uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
