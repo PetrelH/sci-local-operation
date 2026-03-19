@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Shell Agent Console</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap');
+
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg:        #0d0f14;
+    --bg2:       #13161e;
+    --bg3:       #1a1e28;
+    --border:    #252a38;
+    --green:     #00ff88;
+    --green-dim: #00ff8833;
+    --amber:     #ffb700;
+    --red:       #ff4d6d;
+    --blue:      #4d9fff;
+    --muted:     #4a5068;
+    --text:      #c8d0e8;
+    --text2:     #7a839e;
+    --radius:    8px;
+    --mono:      'JetBrains Mono', monospace;
+    --sans:      'Syne', sans-serif;
+  }
+
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); }
+
+  /* ── Layout ── */
+  .shell {
+    display: grid;
+    grid-template-rows: 56px 1fr auto;
+    height: 100vh;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 0 20px;
+  }
+
+  /* ── Header ── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+  }
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 15px;
+    font-weight: 800;
+    letter-spacing: .05em;
+    color: var(--green);
+  }
+  .logo-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 2s ease-in-out infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  .conn-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .conn-row input {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 5px 10px;
+    outline: none;
+    width: 200px;
+    transition: border-color .2s;
+  }
+  .conn-row input:focus { border-color: var(--green); }
+  .conn-row input::placeholder { color: var(--muted); }
+
+  /* ── Output area ── */
+  .output {
+    overflow-y: auto;
+    padding: 20px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+
+  /* ── Entry ── */
+  .entry { display: flex; flex-direction: column; gap: 6px; }
+
+  .entry-cmd {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    font-family: var(--mono);
+    font-size: 13px;
+  }
+  .prompt { color: var(--green); flex-shrink: 0; }
+  .entry-cmd .cmd-text { color: #e8eaf6; word-break: break-all; }
+
+  .entry-meta {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+    padding-left: 22px;
+  }
+  .entry-meta .rc-ok  { color: var(--green); }
+  .entry-meta .rc-err { color: var(--red); }
+
+  .entry-output {
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--border);
+    border-radius: 0 var(--radius) var(--radius) 0;
+    padding: 12px 16px;
+    font-family: var(--mono);
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--text);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 400px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+    transition: border-color .2s;
+  }
+  .entry-output.ok  { border-left-color: var(--green); }
+  .entry-output.err { border-left-color: var(--red); }
+  .entry-output.streaming { border-left-color: var(--amber); }
+
+  .entry-output .stderr-line { color: var(--red); }
+
+  /* ── Skeleton loader ── */
+  .skeleton {
+    height: 14px; border-radius: 4px;
+    background: linear-gradient(90deg, var(--bg3) 25%, var(--border) 50%, var(--bg3) 75%);
+    background-size: 200% 100%;
+    animation: shimmer 1.2s infinite;
+    margin-bottom: 6px;
+  }
+  @keyframes shimmer { to { background-position: -200% 0; } }
+
+  /* ── Welcome ── */
+  .welcome {
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.9;
+    color: var(--muted);
+    padding: 8px 0 4px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 8px;
+  }
+  .welcome .hi { color: var(--green); font-size: 14px; font-weight: 600; }
+
+  /* ── Input bar ── */
+  .input-bar {
+    border-top: 1px solid var(--border);
+    padding: 16px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .input-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--bg2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 10px 14px;
+    transition: border-color .2s;
+  }
+  .input-row:focus-within { border-color: var(--green); }
+  .input-row .prompt { font-family: var(--mono); font-size: 14px; }
+
+  #cmd-input {
+    flex: 1;
+    background: transparent;
+    border: none;
+    outline: none;
+    color: #e8eaf6;
+    font-family: var(--mono);
+    font-size: 13px;
+    caret-color: var(--green);
+  }
+  #cmd-input::placeholder { color: var(--muted); }
+
+  .btn {
+    background: var(--green-dim);
+    border: 1px solid var(--green);
+    border-radius: 6px;
+    color: var(--green);
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    padding: 6px 14px;
+    cursor: pointer;
+    transition: background .15s, transform .1s;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .btn:hover { background: #00ff8855; }
+  .btn:active { transform: scale(.96); }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
+  .btn.danger { background: #ff4d6d1a; border-color: var(--red); color: var(--red); }
+  .btn.danger:hover { background: #ff4d6d33; }
+
+  .opts-row {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 12px;
+    color: var(--text2);
+    font-family: var(--mono);
+  }
+  .opts-row label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+  .opts-row input[type=number] {
+    width: 52px;
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 2px 6px;
+    outline: none;
+  }
+  .toggle {
+    appearance: none; width: 30px; height: 16px;
+    border-radius: 8px; background: var(--border); cursor: pointer;
+    position: relative; transition: background .2s;
+  }
+  .toggle::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--text2); transition: transform .2s, background .2s;
+  }
+  .toggle:checked { background: var(--green-dim); }
+  .toggle:checked::after { transform: translateX(14px); background: var(--green); }
+
+  .shortcut-hint {
+    font-size: 11px;
+    color: var(--muted);
+    font-family: var(--mono);
+  }
+  kbd {
+    background: var(--bg3);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 5px;
+    font-size: 10px;
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+
+  <!-- Header -->
+  <header>
+    <div class="logo">
+      <div class="logo-dot"></div>
+      SHELL AGENT
+    </div>
+    <div class="conn-row">
+      <input id="agent-url"   placeholder="http://192.168.1.100:8000" value="http://localhost:8000">
+      <input id="agent-token" placeholder="x-token" value="my-secret-token" type="password" style="width:140px">
+    </div>
+  </header>
+
+  <!-- Output -->
+  <div class="output" id="output">
+    <div class="welcome">
+      <div class="hi">// Shell Agent Console</div>
+      <div>连接到远程 macOS 主机，在下方输入命令后按 Enter 执行。</div>
+      <div>支持流式输出（适合 ping / 编译等长命令），使用 zsh 执行。</div>
+      <div style="color:var(--amber)">⚠  请确保 Token 正确，并仅在受信网络中使用。</div>
+    </div>
+  </div>
+
+  <!-- Input bar -->
+  <div class="input-bar">
+    <div class="input-row">
+      <span class="prompt" style="color:var(--green)">❯</span>
+      <input id="cmd-input" placeholder="输入 Shell 命令，如 ifconfig / ls -la / top -l 1" autocomplete="off" spellcheck="false">
+      <button class="btn" id="run-btn" onclick="runCmd()">RUN</button>
+      <button class="btn danger" onclick="clearOutput()">CLR</button>
+    </div>
+    <div class="opts-row">
+      <label>
+        <input class="toggle" type="checkbox" id="stream-toggle">
+        流式输出
+      </label>
+      <label>
+        超时 <input type="number" id="timeout-val" value="30" min="1" max="300"> 秒
+      </label>
+      <span class="shortcut-hint"><kbd>Enter</kbd> 执行 &nbsp; <kbd>↑↓</kbd> 历史</span>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  const outputEl  = document.getElementById('output');
+  const cmdInput  = document.getElementById('cmd-input');
+  const runBtn    = document.getElementById('run-btn');
+
+  let history = [];
+  let histIdx  = -1;
+
+  // ── 键盘：Enter 执行，↑↓ 历史 ──────────────────────────────
+  cmdInput.addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runCmd(); return; }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (history.length === 0) return;
+      histIdx = Math.min(histIdx + 1, history.length - 1);
+      cmdInput.value = history[histIdx];
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      histIdx = Math.max(histIdx - 1, -1);
+      cmdInput.value = histIdx === -1 ? '' : history[histIdx];
+    }
+  });
+
+  // ── 清空 ───────────────────────────────────────────────────
+  function clearOutput() {
+    outputEl.innerHTML = '';
+  }
+
+  // ── 滚到底 ─────────────────────────────────────────────────
+  function scrollBottom() {
+    outputEl.scrollTop = outputEl.scrollHeight;
+  }
+
+  // ── 创建 Entry DOM ──────────────────────────────────────────
+  function createEntry(cmd) {
+    const entry = document.createElement('div');
+    entry.className = 'entry';
+
+    const cmdRow = document.createElement('div');
+    cmdRow.className = 'entry-cmd';
+    cmdRow.innerHTML = `<span class="prompt">❯</span><span class="cmd-text">${escHtml(cmd)}</span>`;
+
+    const meta = document.createElement('div');
+    meta.className = 'entry-meta';
+    meta.textContent = new Date().toLocaleTimeString();
+
+    const out = document.createElement('div');
+    out.className = 'entry-output';
+
+    entry.appendChild(cmdRow);
+    entry.appendChild(meta);
+    entry.appendChild(out);
+    outputEl.appendChild(entry);
+    scrollBottom();
+    return { entry, meta, out };
+  }
+
+  // ── 骨架加载动画 ────────────────────────────────────────────
+  function showSkeleton(el) {
+    el.innerHTML = [70, 90, 55].map(w =>
+      `<div class="skeleton" style="width:${w}%"></div>`
+    ).join('');
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // ── 主执行函数 ──────────────────────────────────────────────
+  async function runCmd() {
+    const cmd   = cmdInput.value.trim();
+    if (!cmd) return;
+    const url   = document.getElementById('agent-url').value.trim().replace(/\/$/, '');
+    const token = document.getElementById('agent-token').value.trim();
+    const stream = document.getElementById('stream-toggle').checked;
+    const timeout = parseInt(document.getElementById('timeout-val').value) || 30;
+
+    // 历史
+    history.unshift(cmd);
+    histIdx = -1;
+    cmdInput.value = '';
+    runBtn.disabled = true;
+
+    const { meta, out } = createEntry(cmd);
+    showSkeleton(out);
+
+    try {
+      if (stream) {
+        await runStream(url, token, cmd, timeout, meta, out);
+      } else {
+        await runSync(url, token, cmd, timeout, meta, out);
+      }
+    } catch (e) {
+      out.className = 'entry-output err';
+      out.textContent = '❌ 连接失败：' + e.message;
+      meta.innerHTML = `<span class="rc-err">network error</span>`;
+    } finally {
+      runBtn.disabled = false;
+      cmdInput.focus();
+      scrollBottom();
+    }
+  }
+
+  // ── 同步执行 ────────────────────────────────────────────────
+  async function runSync(url, token, cmd, timeout, meta, out) {
+    const t0 = Date.now();
+    const res = await fetch(`${url}/exec`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-token': token },
+      body: JSON.stringify({ command: cmd, timeout }),
+    });
+
+    const data = await res.json();
+    const elapsed = Date.now() - t0;
+
+    if (!res.ok) {
+      out.className = 'entry-output err';
+      out.textContent = `HTTP ${res.status}: ${data.detail || JSON.stringify(data)}`;
+      meta.innerHTML = `<span class="rc-err">HTTP ${res.status}</span>`;
+      return;
+    }
+
+    const rc  = data.returncode;
+    const dur = data.duration_ms ?? elapsed;
+    out.className = `entry-output ${rc === 0 ? 'ok' : 'err'}`;
+
+    let html = '';
+    if (data.stdout) html += escHtml(data.stdout);
+    if (data.stderr)  html += `<span class="stderr-line">${escHtml(data.stderr)}</span>`;
+    if (!html)        html = '<span style="color:var(--muted)">(no output)</span>';
+    out.innerHTML = html;
+
+    meta.innerHTML =
+      `rc=<span class="${rc===0?'rc-ok':'rc-err'}">${rc}</span>` +
+      ` &nbsp; ${dur}ms &nbsp; ${new Date().toLocaleTimeString()}`;
+  }
+
+  // ── 流式执行（SSE）──────────────────────────────────────────
+  async function runStream(url, token, cmd, timeout, meta, out) {
+    out.className = 'entry-output streaming';
+    out.textContent = '';
+
+    const res = await fetch(`${url}/exec/stream`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-token': token },
+      body: JSON.stringify({ command: cmd, timeout, stream: true }),
+    });
+
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      out.className = 'entry-output err';
+      out.textContent = `HTTP ${res.status}: ${data.detail || ''}`;
+      meta.innerHTML = `<span class="rc-err">HTTP ${res.status}</span>`;
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    let rc  = null;
+    meta.textContent = '⏳ streaming...';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      const lines = buf.split('\n');
+      buf = lines.pop();   // 保留未完整行
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        try {
+          const obj = JSON.parse(line.slice(6));
+          if (obj.done) {
+            rc = obj.returncode;
+          } else if (obj.line != null) {
+            out.textContent += obj.line;
+            scrollBottom();
+          }
+        } catch (_) {}
+      }
+    }
+
+    out.className = `entry-output ${(rc ?? 0) === 0 ? 'ok' : 'err'}`;
+    if (rc !== null) {
+      meta.innerHTML =
+        `rc=<span class="${rc===0?'rc-ok':'rc-err'}">${rc}</span>` +
+        ` &nbsp; stream &nbsp; ${new Date().toLocaleTimeString()}`;
+    }
+  }
+
+  // 自动聚焦
+  cmdInput.focus();
+</script>
+</body>
+</html>
