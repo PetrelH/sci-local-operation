@@ -4,6 +4,7 @@ Shell Agent — MQ Producer API（数据库定时任务版）
   1. 每隔固定时间（默认 5 分钟）从 MySQL 读取待执行任务
   2. AES-256-CBC 加密命令后发送到对应用户的 RabbitMQ 队列
   3. HTTP API 供外部系统手动提交命令 / 查看任务状态
+  4. /key/register 接口：接收 secret_key，派生 AES key = MD5(secret) || MD5(MD5(secret))
 
 依赖：
     pip install fastapi uvicorn pika cryptography pymysql sqlalchemy apscheduler
@@ -11,7 +12,7 @@ Shell Agent — MQ Producer API（数据库定时任务版）
 环境变量：
     MQ_HOST / MQ_PORT / MQ_USER / MQ_PASS / MQ_VHOST
     DB_HOST / DB_PORT / DB_USER / DB_PASS / DB_NAME
-    AES_KEY         AES-256 密钥 base64（必填，32字节）
+    AES_KEY         全局 AES-256 密钥 base64（可选，未注册用户的 fallback）
     API_TOKEN       接口鉴权 Token（默认 producer-secret）
     API_HOST / API_PORT
     POLL_INTERVAL   数据库轮询间隔秒数（默认 300，即 5 分钟）
@@ -28,6 +29,7 @@ import os
 import json
 import base64
 import uuid
+import hashlib
 import datetime
 import logging
 import threading
@@ -70,11 +72,32 @@ DB_USER       = os.getenv("DB_USER",       "root")
 DB_PASS       = os.getenv("DB_PASS",       "")
 DB_NAME       = os.getenv("DB_NAME",       "shellagent")
 
-AES_KEY_B64   = os.getenv("AES_KEY",       "")
+AES_KEY_B64   = os.getenv("AES_KEY",       "")   # 全局 fallback key（可选）
 API_TOKEN     = os.getenv("API_TOKEN",     "producer-secret")
 API_HOST      = os.getenv("API_HOST",      "0.0.0.0")
 API_PORT      = int(os.getenv("API_PORT",  "9000"))
 POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
+
+
+# ══════════════════════════════════════════════════════════════
+# 密钥派生：AES key = MD5(secret) || MD5(MD5(secret)) → 32 bytes
+# ══════════════════════════════════════════════════════════════
+
+def derive_aes_key(secret_key: str) -> bytes:
+    """
+    派生规则：
+      first   = MD5(secret_key)   → 16 bytes
+      second  = MD5(first)        → 16 bytes
+      aes_key = first || second   → 32 bytes（AES-256）
+    两端只要 secret_key 相同，派生结果必然一致。
+    """
+    first  = hashlib.md5(secret_key.encode("utf-8")).digest()
+    second = hashlib.md5(first).digest()
+    return first + second
+
+
+def derive_aes_key_b64(secret_key: str) -> str:
+    return base64.b64encode(derive_aes_key(secret_key)).decode()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -84,8 +107,24 @@ POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 Base = declarative_base()
 
 
+class UserKey(Base):
+    """用户密钥表：存储原始 secret_key 及派生的 aes_key_b64"""
+    __tablename__ = "user_keys"
+
+    user_id     = Column(String(64),  primary_key=True, comment="用户ID")
+    secret_key  = Column(String(255), nullable=False,   comment="原始 secret key")
+    aes_key_b64 = Column(String(255), nullable=False,   comment="派生的 AES-256 key（base64）")
+    created_at  = Column(DateTime, default=datetime.datetime.now)
+    updated_at  = Column(
+        DateTime,
+        default=datetime.datetime.now,
+        onupdate=datetime.datetime.now,
+    )
+
+
 class CommandTask(Base):
-    __tablename__ = "command_tasks"
+    """命令任务表"""
+    __tablename__ = "t_command_tasks"
 
     id           = Column(String(36),  primary_key=True, default=lambda: str(uuid.uuid4()))
     user_id      = Column(String(64),  nullable=False,  index=True)
@@ -106,10 +145,13 @@ class CommandTask(Base):
 
 
 def make_db_url() -> str:
-    return f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
+    return (
+        f"mysql+pymysql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}"
+        f"/{DB_NAME}?charset=utf8mb4"
+    )
 
 
-_engine = None
+_engine         = None
 _SessionFactory = None
 
 
@@ -136,34 +178,78 @@ def get_session() -> Session:
 def init_db():
     engine = create_engine(make_db_url(), pool_pre_ping=True)
     Base.metadata.create_all(engine)
-    log.info("数据库表初始化完成")
+    log.info("数据库表初始化完成（command_tasks + user_keys）")
 
 
 # ══════════════════════════════════════════════════════════════
-# AES-256-CBC
+# AES-256-CBC 加解密
 # ══════════════════════════════════════════════════════════════
 
-def _get_aes_key() -> bytes:
-    if not AES_KEY_B64:
-        raise ValueError("AES_KEY 未设置")
-    key = base64.b64decode(AES_KEY_B64)
-    if len(key) != 32:
-        raise ValueError(f"AES_KEY 须为 32 字节，当前 {len(key)} 字节")
-    return key
+def _resolve_raw_key(key_b64: Optional[str]) -> bytes:
+    """将 base64 key 解码为 bytes，支持传 None 时 fallback 到全局 AES_KEY_B64"""
+    source = key_b64 if key_b64 else AES_KEY_B64
+    if not source:
+        raise ValueError("未提供 AES key，且未配置全局 AES_KEY 环境变量")
+    raw = base64.b64decode(source)
+    if len(raw) != 32:
+        raise ValueError(f"AES key 须为 32 字节，当前 {len(raw)} 字节")
+    return raw
 
 
-def aes_encrypt(plaintext: str) -> dict:
-    key = _get_aes_key()
-    iv  = os.urandom(16)
-    padder = aes_padding.PKCS7(128).padder()
-    padded = padder.update(plaintext.encode()) + padder.finalize()
-    cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
-    enc = cipher.encryptor()
-    ct  = enc.update(padded) + enc.finalize()
+def aes_encrypt(plaintext: str, key_b64: Optional[str] = None) -> dict:
+    """
+    AES-256-CBC 加密
+    key_b64: 用户专属 key（base64），None 时使用全局 AES_KEY 环境变量
+    返回: {"iv": base64, "data": base64}
+    """
+    raw_key = _resolve_raw_key(key_b64)
+    iv      = os.urandom(16)
+    padder  = aes_padding.PKCS7(128).padder()
+    padded  = padder.update(plaintext.encode("utf-8")) + padder.finalize()
+    cipher  = Cipher(algorithms.AES(raw_key), modes.CBC(iv), backend=default_backend())
+    enc     = cipher.encryptor()
+    ct      = enc.update(padded) + enc.finalize()
     return {
         "iv":   base64.b64encode(iv).decode(),
         "data": base64.b64encode(ct).decode(),
     }
+
+
+def aes_decrypt(payload: dict, key_b64: Optional[str] = None) -> str:
+    """
+    AES-256-CBC 解密
+    payload: {"iv": base64, "data": base64}
+    """
+    raw_key   = _resolve_raw_key(key_b64)
+    iv        = base64.b64decode(payload["iv"])
+    ct        = base64.b64decode(payload["data"])
+    cipher    = Cipher(algorithms.AES(raw_key), modes.CBC(iv), backend=default_backend())
+    decryptor = cipher.decryptor()
+    padded    = decryptor.update(ct) + decryptor.finalize()
+    unpadder  = aes_padding.PKCS7(128).unpadder()
+    return (unpadder.update(padded) + unpadder.finalize()).decode("utf-8")
+
+
+# ══════════════════════════════════════════════════════════════
+# 用户密钥查询
+# ══════════════════════════════════════════════════════════════
+
+def get_user_aes_key_b64(user_id: str, session: Session) -> str:
+    """
+    按 user_id 查询派生后的 aes_key_b64。
+    找不到时 fallback 到全局 AES_KEY_B64 环境变量。
+    两者都没有则抛 ValueError。
+    """
+    record = session.query(UserKey).filter(UserKey.user_id == user_id).first()
+    if record:
+        return record.aes_key_b64
+    if AES_KEY_B64:
+        log.warning(f"用户 {user_id} 未注册密钥，使用全局 AES_KEY fallback")
+        return AES_KEY_B64
+    raise ValueError(
+        f"用户 {user_id} 未注册密钥，且未配置全局 AES_KEY 环境变量。"
+        "请先调用 POST /key/register 注册密钥。"
+    )
 
 
 # ══════════════════════════════════════════════════════════════
@@ -209,7 +295,7 @@ class MQClient:
                 )
                 return
             except Exception as e:
-                log.warning(f"发布失败（第{attempt+1}次）：{e}")
+                log.warning(f"发布失败（第 {attempt + 1} 次）：{e}")
                 self._conn = None
                 if attempt == 2:
                     raise
@@ -227,19 +313,34 @@ mq = MQClient()
 # 核心：加密并发送单条任务
 # ══════════════════════════════════════════════════════════════
 
-def send_encrypted_command(task: CommandTask) -> str:
-    cmd_id   = str(uuid.uuid4())
-    queue    = f"agent.{task.user_id}"
-    reply_to = task.reply_to or f"result.{task.user_id}"
-    msg = {
-        "cmd_id":   cmd_id,
-        "command":  task.command,
-        "timeout":  task.timeout,
-        "reply_to": reply_to,
-    }
-    encrypted = aes_encrypt(json.dumps(msg, ensure_ascii=False))
-    mq.publish(queue, encrypted, cmd_id, reply_to)
-    return cmd_id
+def send_encrypted_command(task: CommandTask, session: Optional[Session] = None) -> str:
+    """
+    按 task.user_id 查询对应的 AES key，加密命令后发送到 RabbitMQ。
+    session 由调用方传入（避免重复开关）；若为 None 则内部自开自关。
+    """
+    _own_session = session is None
+    _session     = get_session() if _own_session else session
+    try:
+        key_b64  = get_user_aes_key_b64(task.user_id, _session)
+        cmd_id   = str(uuid.uuid4())
+        queue    = f"agent.{task.user_id}"
+        reply_to = task.reply_to or f"result.{task.user_id}"
+        msg = {
+            "cmd_id":   cmd_id,
+            "command":  task.command,
+            "timeout":  task.timeout,
+            "reply_to": reply_to,
+        }
+        encrypted = aes_encrypt(json.dumps(msg, ensure_ascii=False), key_b64)
+        mq.publish(queue, encrypted, cmd_id, reply_to)
+        log.info(
+            f"命令已加密发送  user={task.user_id}"
+            f"  queue={queue}  cmd_id={cmd_id}"
+        )
+        return cmd_id
+    finally:
+        if _own_session:
+            _session.close()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -248,10 +349,11 @@ def send_encrypted_command(task: CommandTask) -> str:
 
 def poll_and_send():
     log.info("▶  轮询数据库待发任务...")
-    session = get_session()
-    sent_count = failed_count = 0
+    session      = get_session()
+    sent_count   = 0
+    failed_count = 0
     try:
-        now = datetime.datetime.now()
+        now   = datetime.datetime.now()
         tasks = (
             session.query(CommandTask)
             .filter(
@@ -259,7 +361,7 @@ def poll_and_send():
                 CommandTask.retry_count < CommandTask.max_retries,
                 (CommandTask.scheduled_at == None) | (CommandTask.scheduled_at <= now),
             )
-            .with_for_update(skip_locked=True)   # 防多实例重复发送
+            .with_for_update(skip_locked=True)
             .order_by(CommandTask.created_at)
             .limit(100)
             .all()
@@ -272,12 +374,15 @@ def poll_and_send():
         log.info(f"   发现 {len(tasks)} 条待发任务")
         for task in tasks:
             try:
-                cmd_id = send_encrypted_command(task)
+                cmd_id       = send_encrypted_command(task, session)
                 task.status  = "sent"
                 task.cmd_id  = cmd_id
                 task.sent_at = datetime.datetime.now()
                 session.commit()
-                log.info(f"   ✓ id={task.id}  user={task.user_id}  cmd={task.command!r}  cmd_id={cmd_id}")
+                log.info(
+                    f"   ✓ id={task.id}  user={task.user_id}"
+                    f"  cmd={task.command!r}  cmd_id={cmd_id}"
+                )
                 sent_count += 1
             except Exception as e:
                 task.retry_count += 1
@@ -286,7 +391,10 @@ def poll_and_send():
                     task.status = "failed"
                     log.error(f"   ✗ 达到最大重试次数  id={task.id}  err={e}")
                 else:
-                    log.warning(f"   ✗ 发送失败（第{task.retry_count}次）id={task.id}  将重试")
+                    log.warning(
+                        f"   ✗ 发送失败（第 {task.retry_count} 次）"
+                        f"  id={task.id}  将重试  err={e}"
+                    )
                 session.commit()
                 failed_count += 1
 
@@ -305,41 +413,55 @@ scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 # Pydantic 模型
 # ══════════════════════════════════════════════════════════════
 
-class SendRequest(BaseModel):
-    user_id:      str           = Field(...,  description="目标用户ID，命令发到 agent.{user_id} 队列", example="user123")
-    command:      str           = Field(...,  description="待执行的 Shell 命令", example="df -h")
-    timeout:      int           = Field(30,   description="命令超时秒数", ge=1, le=300, example=30)
-    reply_to:     Optional[str] = Field(None, description="结果回写队列，默认 result.{user_id}", example=None)
-    scheduled_at: Optional[str] = Field(None, description="计划执行时间（ISO8601），空=立即执行", example=None)
-    max_retries:  int           = Field(3,    description="最大重试次数", ge=0, le=10, example=3)
+class KeyRegisterRequest(BaseModel):
+    user_id:    str = Field(..., min_length=1, description="用户ID", example="user123")
+    secret_key: str = Field(..., min_length=6, description="App 端输入的原始密钥（至少 6 位）", example="MyP@ssw0rd!")
 
     class Config:
         json_schema_extra = {
             "example": {
-                "user_id":  "user123",
-                "command":  "ls -la ~/Desktop",
-                "timeout":  30,
-                "reply_to": None,
+                "user_id":    "user123",
+                "secret_key": "MyP@ssw0rd!",
+            }
+        }
+
+
+class KeyVerifyRequest(BaseModel):
+    user_id:    str = Field(..., description="用户ID",       example="user123")
+    secret_key: str = Field(..., description="待验证的原始密钥", example="MyP@ssw0rd!")
+
+
+class SendRequest(BaseModel):
+    user_id:      str           = Field(...,  description="目标用户ID，命令发到 agent.{user_id} 队列", example="user123")
+    command:      str           = Field(...,  description="待执行的 Shell 命令", example="df -h")
+    timeout:      int           = Field(30,   description="命令超时秒数", ge=1, le=300, example=30)
+    reply_to:     Optional[str] = Field(None, description="结果回写队列，默认 result.{user_id}")
+    scheduled_at: Optional[str] = Field(None, description="计划执行时间（ISO8601），空=立即执行")
+    max_retries:  int           = Field(3,    description="最大重试次数", ge=0, le=10)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "user_id":      "user123",
+                "command":      "ls -la ~/Desktop",
+                "timeout":      30,
+                "reply_to":     None,
                 "scheduled_at": None,
-                "max_retries": 3,
+                "max_retries":  3,
             }
         }
 
 
 class BatchSendRequest(BaseModel):
-    commands: list[SendRequest] = Field(
-        ...,
-        max_length=50,
-        description="命令列表，最多 50 条",
-    )
+    commands: list[SendRequest] = Field(..., max_length=50, description="命令列表，最多 50 条")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "commands": [
-                    {"user_id": "user123", "command": "df -h",    "timeout": 30},
-                    {"user_id": "user456", "command": "uptime",   "timeout": 10},
-                    {"user_id": "user123", "command": "ls ~/Desktop", "scheduled_at": "2024-06-01T09:00:00"},
+                    {"user_id": "user123", "command": "df -h",       "timeout": 30},
+                    {"user_id": "user456", "command": "uptime",       "timeout": 10},
+                    {"user_id": "user123", "command": "ls ~/Desktop", "scheduled_at": "2026-04-01T09:00:00"},
                 ]
             }
         }
@@ -351,7 +473,7 @@ class BatchSendRequest(BaseModel):
 
 def check_token(x_token: str):
     if x_token != API_TOKEN:
-        raise HTTPException(401, "Unauthorized")
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid token")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -362,7 +484,7 @@ def check_token(x_token: str):
 async def lifespan(app: FastAPI):
     try:
         Base.metadata.create_all(get_engine())
-        log.info("数据库连接正常")
+        log.info("数据库连接正常，表结构已同步")
     except Exception as e:
         log.error(f"数据库连接失败：{e}")
 
@@ -371,117 +493,243 @@ async def lifespan(app: FastAPI):
         trigger=IntervalTrigger(seconds=POLL_INTERVAL),
         id="db_poll",
         replace_existing=True,
-        next_run_time=datetime.datetime.now(),  # 启动时立即执行一次
+        next_run_time=datetime.datetime.now(),
     )
     scheduler.start()
 
     log.info(f"✅  MQ Producer API 启动  {API_HOST}:{API_PORT}")
-    log.info(f"    RabbitMQ: {MQ_HOST}:{MQ_PORT}  |  MySQL: {DB_HOST}/{DB_NAME}")
-    log.info(f"    轮询间隔: {POLL_INTERVAL}s  |  AES: {'已配置' if AES_KEY_B64 else '⚠ 未配置'}")
+    log.info(f"    RabbitMQ : {MQ_HOST}:{MQ_PORT}  vhost={MQ_VHOST}")
+    log.info(f"    MySQL    : {DB_HOST}:{DB_PORT}/{DB_NAME}")
+    log.info(f"    轮询间隔 : {POLL_INTERVAL}s")
+    log.info(f"    全局 AES : {'已配置（fallback）' if AES_KEY_B64 else '未配置（仅使用用户专属 key）'}")
+
     yield
+
     scheduler.shutdown(wait=False)
     mq.close()
-    log.info("服务关闭")
+    log.info("服务已关闭")
 
 
 tags_metadata = [
-    {
-        "name": "命令发送",
-        "description": "手动提交命令，加密后立即或按计划发送到 RabbitMQ。",
-    },
-    {
-        "name": "任务管理",
-        "description": "查询、重试数据库中的命令任务，状态流转：`pending → sent / failed`。",
-    },
-    {
-        "name": "轮询控制",
-        "description": "手动触发数据库轮询，无需等待下一个定时周期。",
-    },
-    {
-        "name": "系统",
-        "description": "健康检查、AES 密钥生成等工具接口。",
-    },
+    {"name": "密钥管理", "description": "注册/更新/验证/删除用户密钥，派生规则：MD5(secret) ‖ MD5(MD5(secret))。"},
+    {"name": "命令发送", "description": "手动提交命令，加密后立即或按计划发送到 RabbitMQ。"},
+    {"name": "任务管理", "description": "查询、重试数据库中的命令任务，状态流转：pending → sent / failed。"},
+    {"name": "轮询控制", "description": "手动触发数据库轮询，无需等待下一个定时周期。"},
+    {"name": "系统",     "description": "健康检查、AES 密钥生成等工具接口。"},
 ]
 
 app = FastAPI(
     title="Shell Agent — MQ Producer API",
-    version="1.0.0",
+    version="2.0.0",
     description="""
 ## MQ Producer API
 
 从 MySQL 读取待执行任务，AES-256-CBC 加密后定时发送到 RabbitMQ 对应用户队列。
 
+### 密钥派生规则
+```
+aes_key = MD5(secret_key) || MD5(MD5(secret_key))   →  32 bytes (AES-256)
+```
+App 端调用 `POST /key/register` 传入 `secret_key`，服务端派生并存储 AES key。
+Consumer 端用**相同的 secret_key** 本地派生，AES key 永不通过网络传输。
+
 ### 工作流程
 ```
-外部系统 → POST /send → 写入 MySQL
-                            ↓
-                  每 5 分钟定时轮询 pending 任务
-                            ↓
-                  AES-256-CBC 加密命令
-                            ↓
-                  发送到 agent.{user_id} 队列
-                            ↓
-                  Mac 本地 mq_consumer 消费执行
-```
-
-### 鉴权
-所有接口需在请求头携带：
-```
-x-token: <API_TOKEN>
+App → POST /key/register {user_id, secret_key}
+               ↓ 派生 aes_key 存入 user_keys 表
+App → POST /send {user_id, command}
+               ↓ 用该用户的 aes_key 加密
+          RabbitMQ agent.{user_id}
+               ↓
+          Consumer 本地派生 aes_key 解密执行
+               ↓
+          RabbitMQ result.{user_id}（加密结果）
 ```
 
 ### 任务状态
 | 状态 | 说明 |
 |------|------|
 | `pending` | 待发送（初始状态） |
-| `sent` | 已加密发送到 MQ |
-| `failed` | 超过最大重试次数，发送失败 |
-
-### AES 加密格式
-消息体为 JSON，字段如下：
-```json
-{"iv": "base64...", "data": "base64..."}
-```
+| `sent`    | 已加密发送到 MQ   |
+| `failed`  | 超过最大重试次数   |
 """,
     openapi_tags=tags_metadata,
     docs_url="/docs",
     redoc_url="/redoc",
     lifespan=lifespan,
 )
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ══════════════════════════════════════════════════════════════
-# 路由
+# 路由 — 密钥管理
 # ══════════════════════════════════════════════════════════════
+
+@app.post(
+    "/key/register",
+    tags=["密钥管理"],
+    summary="注册/更新用户密钥",
+    description="""
+接收 App 端输入的 `secret_key`，服务端执行派生：
+```
+first    = MD5(secret_key)     # 16 bytes
+second   = MD5(first)          # 16 bytes
+aes_key  = first || second     # 32 bytes → AES-256
+```
+派生结果存入 `user_keys` 表。Consumer 端用同样规则本地派生，AES key 永不出现在网络请求中。
+""",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "user_id":         "user123",
+                        "status":          "created",
+                        "aes_key_preview": "abcd1234...",
+                    }
+                }
+            }
+        },
+        400: {"description": "secret_key 长度不足"},
+        401: {"description": "Token 错误"},
+        500: {"description": "数据库写入失败"},
+    },
+)
+async def register_key(body: KeyRegisterRequest, x_token: str = Header(...)):
+    check_token(x_token)
+
+    aes_key_b64 = derive_aes_key_b64(body.secret_key)
+    session     = get_session()
+    try:
+        record = session.query(UserKey).filter(UserKey.user_id == body.user_id).first()
+        if record:
+            record.secret_key  = body.secret_key
+            record.aes_key_b64 = aes_key_b64
+            record.updated_at  = datetime.datetime.now()
+            action = "updated"
+        else:
+            session.add(UserKey(
+                user_id=body.user_id,
+                secret_key=body.secret_key,
+                aes_key_b64=aes_key_b64,
+            ))
+            action = "created"
+        session.commit()
+        log.info(f"密钥 {action}：user_id={body.user_id}")
+        return {
+            "user_id":         body.user_id,
+            "status":          action,
+            "aes_key_preview": aes_key_b64[:8] + "...",
+        }
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=f"密钥存储失败：{e}")
+    finally:
+        session.close()
+
+
+@app.post(
+    "/key/verify",
+    tags=["密钥管理"],
+    summary="验证用户密钥是否正确",
+    description="传入 `secret_key`，与数据库存储的 `secret_key` 比对，返回是否匹配。",
+    responses={
+        200: {"content": {"application/json": {"example": {"user_id": "user123", "match": True}}}},
+        404: {"description": "用户未注册密钥"},
+    },
+)
+async def verify_key(body: KeyVerifyRequest, x_token: str = Header(...)):
+    check_token(x_token)
+    session = get_session()
+    try:
+        record = session.query(UserKey).filter(UserKey.user_id == body.user_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail=f"用户 {body.user_id} 未注册密钥")
+        match = record.secret_key == body.secret_key
+        return {"user_id": body.user_id, "match": match}
+    finally:
+        session.close()
+
 
 @app.get(
-    "/health",
-    tags=["系统"],
-    summary="健康检查",
-    response_description="MQ、数据库连接状态及下次轮询时间",
+    "/key/{user_id}",
+    tags=["密钥管理"],
+    summary="查询用户密钥状态",
+    description="返回密钥注册时间、更新时间及 aes_key 预览（前 8 位），不返回原始 secret_key。",
+    responses={
+        200: {
+            "content": {
+                "application/json": {
+                    "example": {
+                        "user_id":         "user123",
+                        "registered":      True,
+                        "aes_key_preview": "abcd1234...",
+                        "created_at":      "2026-01-01T09:00:00",
+                        "updated_at":      "2026-01-02T10:00:00",
+                    }
+                }
+            }
+        },
+        404: {"description": "用户未注册密钥"},
+    },
 )
-async def health():
-    mq_ok = db_ok = False
+async def get_key_info(user_id: str, x_token: str = Header(...)):
+    check_token(x_token)
+    session = get_session()
     try:
-        mq.channel(); mq_ok = True
-    except Exception:
-        pass
-    try:
-        get_engine().connect().close(); db_ok = True
-    except Exception:
-        pass
-    job = scheduler.get_job("db_poll")
-    return {
-        "status":        "ok" if (mq_ok and db_ok) else "degraded",
-        "mq":            {"host": f"{MQ_HOST}:{MQ_PORT}", "ok": mq_ok},
-        "db":            {"host": f"{DB_HOST}/{DB_NAME}", "ok": db_ok},
-        "poll_interval": f"{POLL_INTERVAL}s",
-        "next_poll":     job.next_run_time.isoformat() if job and job.next_run_time else None,
-        "aes_ready":     bool(AES_KEY_B64),
-        "time":          datetime.datetime.now().isoformat(),
-    }
+        record = session.query(UserKey).filter(UserKey.user_id == user_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail=f"用户 {user_id} 未注册密钥")
+        return {
+            "user_id":         record.user_id,
+            "registered":      True,
+            "aes_key_preview": record.aes_key_b64[:8] + "...",
+            "created_at":      record.created_at.isoformat() if record.created_at else None,
+            "updated_at":      record.updated_at.isoformat() if record.updated_at else None,
+        }
+    finally:
+        session.close()
 
+
+@app.delete(
+    "/key/{user_id}",
+    tags=["密钥管理"],
+    summary="删除用户密钥",
+    description="删除后该用户命令将 fallback 到全局 AES_KEY（若已配置），否则发送时报错。",
+    responses={
+        200: {"content": {"application/json": {"example": {"user_id": "user123", "deleted": True}}}},
+        404: {"description": "用户未注册密钥"},
+    },
+)
+async def delete_key(user_id: str, x_token: str = Header(...)):
+    check_token(x_token)
+    session = get_session()
+    try:
+        record = session.query(UserKey).filter(UserKey.user_id == user_id).first()
+        if not record:
+            raise HTTPException(status_code=404, detail=f"用户 {user_id} 未注册密钥")
+        session.delete(record)
+        session.commit()
+        log.info(f"密钥已删除：user_id={user_id}")
+        return {"user_id": user_id, "deleted": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=f"删除失败：{e}")
+    finally:
+        session.close()
+
+
+# ══════════════════════════════════════════════════════════════
+# 路由 — 命令发送
+# ══════════════════════════════════════════════════════════════
 
 @app.post(
     "/send",
@@ -493,33 +741,43 @@ async def health():
             "content": {
                 "application/json": {
                     "example": {
-                        "id": "uuid-...",
-                        "cmd_id": "uuid-...",
-                        "user_id": "user123",
-                        "command": "ls -la",
-                        "status": "sent",
+                        "id":           "uuid-...",
+                        "cmd_id":       "uuid-...",
+                        "user_id":      "user123",
+                        "command":      "ls -la",
+                        "status":       "sent",
                         "scheduled_at": None,
-                        "created_at": "2024-01-01T09:00:00",
+                        "created_at":   "2026-01-01T09:00:00",
                     }
                 }
             }
         },
         401: {"description": "Token 错误"},
-        500: {"description": "AES_KEY 未配置或 MQ 连接失败"},
+        404: {"description": "用户未注册密钥"},
+        500: {"description": "MQ 连接失败"},
     },
 )
 async def send_command(body: SendRequest, x_token: str = Header(...)):
     check_token(x_token)
-    if not AES_KEY_B64:
-        raise HTTPException(500, "AES_KEY 未配置")
 
     session = get_session()
     try:
-        scheduled = datetime.datetime.fromisoformat(body.scheduled_at) if body.scheduled_at else None
+        # 提前验证用户密钥存在，快速失败
+        get_user_aes_key_b64(body.user_id, session)
+
+        scheduled = (
+            datetime.datetime.fromisoformat(body.scheduled_at)
+            if body.scheduled_at else None
+        )
         task = CommandTask(
-            id=str(uuid.uuid4()), user_id=body.user_id, command=body.command,
-            timeout=body.timeout, reply_to=body.reply_to, max_retries=body.max_retries,
-            scheduled_at=scheduled, status="pending",
+            id=str(uuid.uuid4()),
+            user_id=body.user_id,
+            command=body.command,
+            timeout=body.timeout,
+            reply_to=body.reply_to,
+            max_retries=body.max_retries,
+            scheduled_at=scheduled,
+            status="pending",
         )
         session.add(task)
         session.commit()
@@ -528,22 +786,28 @@ async def send_command(body: SendRequest, x_token: str = Header(...)):
         # 无计划时间则立即发送，不等下次轮询
         if not scheduled:
             try:
-                cmd_id = send_encrypted_command(task)
+                cmd_id       = send_encrypted_command(task, session)
                 task.status  = "sent"
                 task.cmd_id  = cmd_id
                 task.sent_at = datetime.datetime.now()
                 session.commit()
             except Exception as e:
                 task.retry_count += 1
-                task.error_msg = str(e)
+                task.error_msg    = str(e)
                 session.commit()
+                log.error(f"立即发送失败，任务保留 pending 等待轮询重试：{e}")
 
         return {
-            "id": task.id, "cmd_id": task.cmd_id, "user_id": task.user_id,
-            "command": task.command, "status": task.status,
+            "id":           task.id,
+            "cmd_id":       task.cmd_id,
+            "user_id":      task.user_id,
+            "command":      task.command,
+            "status":       task.status,
             "scheduled_at": task.scheduled_at.isoformat() if task.scheduled_at else None,
-            "created_at": task.created_at.isoformat(),
+            "created_at":   task.created_at.isoformat(),
         }
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
     finally:
         session.close()
 
@@ -557,70 +821,96 @@ async def send_command(body: SendRequest, x_token: str = Header(...)):
 )
 async def send_batch(body: BatchSendRequest, x_token: str = Header(...)):
     check_token(x_token)
-    if not AES_KEY_B64:
-        raise HTTPException(500, "AES_KEY 未配置")
 
     session = get_session()
     results = []
     try:
         for item in body.commands:
-            scheduled = datetime.datetime.fromisoformat(item.scheduled_at) if item.scheduled_at else None
+            scheduled = (
+                datetime.datetime.fromisoformat(item.scheduled_at)
+                if item.scheduled_at else None
+            )
             task = CommandTask(
-                id=str(uuid.uuid4()), user_id=item.user_id, command=item.command,
-                timeout=item.timeout, reply_to=item.reply_to, max_retries=item.max_retries,
-                scheduled_at=scheduled, status="pending",
+                id=str(uuid.uuid4()),
+                user_id=item.user_id,
+                command=item.command,
+                timeout=item.timeout,
+                reply_to=item.reply_to,
+                max_retries=item.max_retries,
+                scheduled_at=scheduled,
+                status="pending",
             )
             session.add(task)
             session.flush()
+
             if not scheduled:
                 try:
-                    cmd_id = send_encrypted_command(task)
-                    task.status = "sent"; task.cmd_id = cmd_id
+                    cmd_id       = send_encrypted_command(task, session)
+                    task.status  = "sent"
+                    task.cmd_id  = cmd_id
                     task.sent_at = datetime.datetime.now()
                     results.append({"id": task.id, "cmd_id": cmd_id, "status": "sent"})
                 except Exception as e:
-                    task.retry_count += 1; task.error_msg = str(e)
-                    results.append({"id": task.id, "status": f"failed: {e}"})
+                    task.retry_count += 1
+                    task.error_msg    = str(e)
+                    results.append({"id": task.id, "status": f"error: {e}"})
             else:
                 results.append({"id": task.id, "status": "scheduled"})
+
         session.commit()
     except Exception as e:
         session.rollback()
-        raise HTTPException(500, f"批量提交失败：{e}")
+        raise HTTPException(status_code=500, detail=f"批量提交失败：{e}")
     finally:
         session.close()
+
     return {"total": len(results), "results": results}
 
+
+# ══════════════════════════════════════════════════════════════
+# 路由 — 任务管理
+# ══════════════════════════════════════════════════════════════
 
 @app.get(
     "/tasks",
     tags=["任务管理"],
     summary="查询任务列表",
     description="支持按 `status`（pending/sent/failed）和 `user_id` 过滤，支持分页。",
-    response_description="任务列表及总数",
 )
 async def list_tasks(
-    status: Optional[str] = None, user_id: Optional[str] = None,
-    limit: int = 20, offset: int = 0, x_token: str = Header(...),
+    status:  Optional[str] = None,
+    user_id: Optional[str] = None,
+    limit:   int = 20,
+    offset:  int = 0,
+    x_token: str = Header(...),
 ):
     check_token(x_token)
     session = get_session()
     try:
         q = session.query(CommandTask)
-        if status:  q = q.filter(CommandTask.status == status)
+        if status:  q = q.filter(CommandTask.status  == status)
         if user_id: q = q.filter(CommandTask.user_id == user_id)
         total = q.count()
         tasks = q.order_by(CommandTask.created_at.desc()).limit(limit).offset(offset).all()
         return {
-            "total": total, "limit": limit, "offset": offset,
-            "tasks": [{
-                "id": t.id, "user_id": t.user_id, "command": t.command,
-                "status": t.status, "cmd_id": t.cmd_id,
-                "retry_count": t.retry_count, "error_msg": t.error_msg,
-                "created_at": t.created_at.isoformat() if t.created_at else None,
-                "sent_at": t.sent_at.isoformat() if t.sent_at else None,
-                "scheduled_at": t.scheduled_at.isoformat() if t.scheduled_at else None,
-            } for t in tasks],
+            "total":  total,
+            "limit":  limit,
+            "offset": offset,
+            "tasks": [
+                {
+                    "id":           t.id,
+                    "user_id":      t.user_id,
+                    "command":      t.command,
+                    "status":       t.status,
+                    "cmd_id":       t.cmd_id,
+                    "retry_count":  t.retry_count,
+                    "error_msg":    t.error_msg,
+                    "created_at":   t.created_at.isoformat()   if t.created_at   else None,
+                    "sent_at":      t.sent_at.isoformat()      if t.sent_at      else None,
+                    "scheduled_at": t.scheduled_at.isoformat() if t.scheduled_at else None,
+                }
+                for t in tasks
+            ],
         }
     finally:
         session.close()
@@ -630,7 +920,6 @@ async def list_tasks(
     "/tasks/{task_id}",
     tags=["任务管理"],
     summary="查询单条任务",
-    response_description="任务详细信息，含重试次数和错误原因",
     responses={404: {"description": "任务不存在"}},
 )
 async def get_task(task_id: str, x_token: str = Header(...)):
@@ -639,14 +928,19 @@ async def get_task(task_id: str, x_token: str = Header(...)):
     try:
         task = session.query(CommandTask).filter(CommandTask.id == task_id).first()
         if not task:
-            raise HTTPException(404, f"任务不存在：{task_id}")
+            raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
         return {
-            "id": task.id, "user_id": task.user_id, "command": task.command,
-            "timeout": task.timeout, "status": task.status, "cmd_id": task.cmd_id,
-            "retry_count": task.retry_count, "max_retries": task.max_retries,
-            "error_msg": task.error_msg,
-            "created_at": task.created_at.isoformat() if task.created_at else None,
-            "sent_at": task.sent_at.isoformat() if task.sent_at else None,
+            "id":           task.id,
+            "user_id":      task.user_id,
+            "command":      task.command,
+            "timeout":      task.timeout,
+            "status":       task.status,
+            "cmd_id":       task.cmd_id,
+            "retry_count":  task.retry_count,
+            "max_retries":  task.max_retries,
+            "error_msg":    task.error_msg,
+            "created_at":   task.created_at.isoformat()   if task.created_at   else None,
+            "sent_at":      task.sent_at.isoformat()      if task.sent_at      else None,
             "scheduled_at": task.scheduled_at.isoformat() if task.scheduled_at else None,
         }
     finally:
@@ -657,10 +951,8 @@ async def get_task(task_id: str, x_token: str = Header(...)):
     "/tasks/{task_id}/retry",
     tags=["任务管理"],
     summary="手动重试失败任务",
-    description="将 `failed` 或 `pending` 状态的任务重置为 `pending`，并立即尝试发送。",
-    response_description="重试后的任务状态和 cmd_id",
+    description="将 `failed` 或 `pending` 状态的任务重置后立即尝试重新发送。",
     responses={
-        200: {"content": {"application/json": {"example": {"id": "uuid-...", "cmd_id": "uuid-...", "status": "sent"}}}},
         400: {"description": "任务状态不允许重试"},
         404: {"description": "任务不存在"},
     },
@@ -671,33 +963,41 @@ async def retry_task(task_id: str, x_token: str = Header(...)):
     try:
         task = session.query(CommandTask).filter(CommandTask.id == task_id).first()
         if not task:
-            raise HTTPException(404, f"任务不存在：{task_id}")
+            raise HTTPException(status_code=404, detail=f"任务不存在：{task_id}")
         if task.status not in ("failed", "pending"):
-            raise HTTPException(400, f"只能重试 failed/pending 状态的任务，当前：{task.status}")
-        task.status = "pending"; task.retry_count = 0; task.error_msg = None
+            raise HTTPException(
+                status_code=400,
+                detail=f"只能重试 failed/pending 状态的任务，当前：{task.status}",
+            )
+        task.status      = "pending"
+        task.retry_count = 0
+        task.error_msg   = None
         session.commit()
-        cmd_id = send_encrypted_command(task)
-        task.status = "sent"; task.cmd_id = cmd_id; task.sent_at = datetime.datetime.now()
+
+        cmd_id       = send_encrypted_command(task, session)
+        task.status  = "sent"
+        task.cmd_id  = cmd_id
+        task.sent_at = datetime.datetime.now()
         session.commit()
         return {"id": task_id, "cmd_id": cmd_id, "status": "sent"}
     except HTTPException:
         raise
     except Exception as e:
         session.rollback()
-        raise HTTPException(500, f"重试失败：{e}")
+        raise HTTPException(status_code=500, detail=f"重试失败：{e}")
     finally:
         session.close()
 
+
+# ══════════════════════════════════════════════════════════════
+# 路由 — 轮询控制
+# ══════════════════════════════════════════════════════════════
 
 @app.post(
     "/poll/trigger",
     tags=["轮询控制"],
     summary="手动触发数据库轮询",
-    description="立即执行一次 `poll_and_send()`，无需等待下一个定时周期（默认 5 分钟）。",
-    response_description="触发时间",
-    responses={
-        200: {"content": {"application/json": {"example": {"triggered": True, "time": "2024-01-01T09:00:00"}}}},
-    },
+    description="立即执行一次 `poll_and_send()`，无需等待下一个定时周期。",
 )
 async def trigger_poll(x_token: str = Header(...)):
     check_token(x_token)
@@ -706,30 +1006,59 @@ async def trigger_poll(x_token: str = Header(...)):
     return {"triggered": True, "time": datetime.datetime.now().isoformat()}
 
 
+# ══════════════════════════════════════════════════════════════
+# 路由 — 系统
+# ══════════════════════════════════════════════════════════════
+
+@app.get(
+    "/health",
+    tags=["系统"],
+    summary="健康检查",
+    response_description="MQ、数据库连接状态及下次轮询时间",
+)
+async def health():
+    mq_ok = db_ok = False
+    try:
+        mq.channel()
+        mq_ok = True
+    except Exception:
+        pass
+    try:
+        with get_engine().connect() as conn:
+            conn.close()
+        db_ok = True
+    except Exception:
+        pass
+
+    job = scheduler.get_job("db_poll")
+    return {
+        "status":        "ok" if (mq_ok and db_ok) else "degraded",
+        "mq":            {"host": f"{MQ_HOST}:{MQ_PORT}", "ok": mq_ok},
+        "db":            {"host": f"{DB_HOST}/{DB_NAME}", "ok": db_ok},
+        "poll_interval": f"{POLL_INTERVAL}s",
+        "next_poll":     job.next_run_time.isoformat() if job and job.next_run_time else None,
+        "global_aes":    bool(AES_KEY_B64),
+        "time":          datetime.datetime.now().isoformat(),
+    }
+
+
 @app.post(
     "/gen-key",
     tags=["系统"],
-    summary="生成 AES-256 密钥",
-    description="生成一个新的 32 字节随机密钥（base64 编码），用于 `AES_KEY` 环境变量。**生产环境请妥善保存，消费端需使用同一密钥。**",
-    response_description="base64 编码的密钥及设置命令",
-    responses={
-        200: {
-            "content": {
-                "application/json": {
-                    "example": {
-                        "key_base64": "abc123...base64...",
-                        "usage": 'export AES_KEY="abc123...base64..."',
-                    }
-                }
-            }
-        }
-    },
+    summary="生成随机 AES-256 密钥",
+    description=(
+        "生成一个新的 32 字节随机密钥（base64 编码），可用于 `AES_KEY` 全局环境变量。"
+        "注意：此接口生成的是**随机** key，与 `/key/register` 的**派生** key 无关。"
+    ),
 )
 async def gen_key(x_token: str = Header(...)):
     check_token(x_token)
     key = os.urandom(32)
     b64 = base64.b64encode(key).decode()
-    return {"key_base64": b64, "usage": f'export AES_KEY="{b64}"'}
+    return {
+        "key_base64": b64,
+        "usage":      f'export AES_KEY="{b64}"',
+    }
 
 
 # ══════════════════════════════════════════════════════════════
@@ -738,10 +1067,12 @@ async def gen_key(x_token: str = Header(...)):
 
 if __name__ == "__main__":
     import sys
+
     if "--init-db" in sys.argv:
         init_db()
         sys.exit(0)
+
     if not AES_KEY_B64:
-        log.warning("⚠  AES_KEY 未设置，可运行：")
-        log.warning("   python3 -c \"import os,base64; print(base64.b64encode(os.urandom(32)).decode())\"")
+        log.info("提示：未配置全局 AES_KEY，所有用户需先调用 POST /key/register 注册专属密钥")
+
     uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="warning")
