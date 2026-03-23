@@ -23,13 +23,13 @@ import datetime
 import sys
 import pathlib
 
-# ─── 配置 ────────────────────────────────────────────────────
-TOKEN = os.getenv("AGENT_TOKEN", "my-secret-token")
-HOST  = os.getenv("AGENT_HOST", "0.0.0.0")
-PORT  = int(os.getenv("AGENT_PORT", "8000"))
-
-OUTPUT_ENCODING  = "utf-8"
-BLOCKED_KEYWORDS = ["rm -rf /", "rm -rf ~", ":(){ :|:& };:", "mkfs", "dd if="]
+from config import (
+    AGENT_TOKEN as TOKEN,
+    AGENT_HOST  as HOST,
+    AGENT_PORT  as PORT,
+    OUTPUT_ENCODING,
+    BLOCKED_KEYWORDS,
+)
 
 # ─── 持久化工作目录 ───────────────────────────────────────────
 _cwd = os.path.expanduser("~")
@@ -135,8 +135,8 @@ app.add_middleware(
 
 # ─── Web 控制台（HTTP 提供，避免 file:// 被浏览器拒绝）────────
 _CONSOLE_CANDIDATES = [
-    pathlib.Path("/usr/local/share/shellagent/console.html"),
     pathlib.Path(__file__).parent / "console.html",
+    pathlib.Path("/usr/local/share/shellagent/console.html"),
 ]
 if getattr(sys, "frozen", False):
     _CONSOLE_CANDIDATES.insert(0, pathlib.Path(sys._MEIPASS) / "console.html")

@@ -9,14 +9,6 @@ Shell Agent — MQ Producer API（数据库定时任务版）
 依赖：
     pip install fastapi uvicorn pika cryptography pymysql sqlalchemy apscheduler
 
-环境变量：
-    MQ_HOST / MQ_PORT / MQ_USER / MQ_PASS / MQ_VHOST
-    DB_HOST / DB_PORT / DB_USER / DB_PASS / DB_NAME
-    AES_KEY         全局 AES-256 密钥 base64（可选，未注册用户的 fallback）
-    API_TOKEN       接口鉴权 Token（默认 producer-secret）
-    API_HOST / API_PORT
-    POLL_INTERVAL   数据库轮询间隔秒数（默认 300，即 5 分钟）
-
 启动：
     # 首次运行先初始化数据库
     python3 mq_producer_api.py --init-db
@@ -52,6 +44,24 @@ from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+from config import (
+    MQ_HOST,
+    MQ_PORT,
+    MQ_USER,
+    MQ_PASS,
+    MQ_VHOST,
+    AES_KEY_B64,
+    DB_HOST,
+    DB_PORT,
+    DB_USER,
+    DB_PASS,
+    DB_NAME,
+    API_TOKEN,
+    API_HOST,
+    API_PORT,
+    POLL_INTERVAL,
+)
+
 # ─── 日志 ────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -59,25 +69,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("mq_producer")
-
-# ─── 配置 ────────────────────────────────────────────────────
-MQ_HOST       = os.getenv("MQ_HOST",       "localhost")
-MQ_PORT       = int(os.getenv("MQ_PORT",   "5672"))
-MQ_USER       = os.getenv("MQ_USER",       "guest")
-MQ_PASS       = os.getenv("MQ_PASS",       "guest")
-MQ_VHOST      = os.getenv("MQ_VHOST",      "/")
-
-DB_HOST       = os.getenv("DB_HOST",       "localhost")
-DB_PORT       = int(os.getenv("DB_PORT",   "3306"))
-DB_USER       = os.getenv("DB_USER",       "root")
-DB_PASS       = os.getenv("DB_PASS",       "")
-DB_NAME       = os.getenv("DB_NAME",       "shellagent")
-
-AES_KEY_B64   = os.getenv("AES_KEY",       "")   # 全局 fallback key（可选）
-API_TOKEN     = os.getenv("API_TOKEN",     "producer-secret")
-API_HOST      = os.getenv("API_HOST",      "0.0.0.0")
-API_PORT      = int(os.getenv("API_PORT",  "9000"))
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "300"))
 
 
 # ══════════════════════════════════════════════════════════════
@@ -355,8 +346,6 @@ def poll_and_send():
     failed_count = 0
     try:
         now   = datetime.datetime.now()
-        # 不使用 SKIP LOCKED（MySQL 5.7.6 以下不支持）
-        # 先查 ID 列表，再批量占位 pending→sending，防止多实例重复发送
         task_ids = [r[0] for r in (
             session.query(CommandTask.id)
             .filter(
@@ -411,7 +400,7 @@ def poll_and_send():
                     task.status = "failed"
                     log.error(f"   ✗ 达到最大重试次数  id={task.id}  err={e}")
                 else:
-                    task.status = "pending"  # 回退，等待下次轮询重试
+                    task.status = "pending"
                     log.warning(
                         f"   ✗ 发送失败（第 {task.retry_count} 次）"
                         f"  id={task.id}  将重试  err={e}"
@@ -608,22 +597,6 @@ aes_key  = first || second     # 32 bytes → AES-256
 ```
 派生结果存入 `user_keys` 表。Consumer 端用同样规则本地派生，AES key 永不出现在网络请求中。
 """,
-    responses={
-        200: {
-            "content": {
-                "application/json": {
-                    "example": {
-                        "user_id":         "user123",
-                        "status":          "created",
-                        "aes_key_preview": "abcd1234...",
-                    }
-                }
-            }
-        },
-        400: {"description": "secret_key 长度不足"},
-        401: {"description": "Token 错误"},
-        500: {"description": "数据库写入失败"},
-    },
 )
 async def register_key(body: KeyRegisterRequest, x_token: str = Header(...)):
     check_token(x_token)
@@ -658,16 +631,7 @@ async def register_key(body: KeyRegisterRequest, x_token: str = Header(...)):
         session.close()
 
 
-@app.post(
-    "/key/verify",
-    tags=["密钥管理"],
-    summary="验证用户密钥是否正确",
-    description="传入 `secret_key`，与数据库存储的 `secret_key` 比对，返回是否匹配。",
-    responses={
-        200: {"content": {"application/json": {"example": {"user_id": "user123", "match": True}}}},
-        404: {"description": "用户未注册密钥"},
-    },
-)
+@app.post("/key/verify", tags=["密钥管理"], summary="验证用户密钥是否正确")
 async def verify_key(body: KeyVerifyRequest, x_token: str = Header(...)):
     check_token(x_token)
     session = get_session()
@@ -681,28 +645,7 @@ async def verify_key(body: KeyVerifyRequest, x_token: str = Header(...)):
         session.close()
 
 
-@app.get(
-    "/key/{user_id}",
-    tags=["密钥管理"],
-    summary="查询用户密钥状态",
-    description="返回密钥注册时间、更新时间及 aes_key 预览（前 8 位），不返回原始 secret_key。",
-    responses={
-        200: {
-            "content": {
-                "application/json": {
-                    "example": {
-                        "user_id":         "user123",
-                        "registered":      True,
-                        "aes_key_preview": "abcd1234...",
-                        "created_at":      "2026-01-01T09:00:00",
-                        "updated_at":      "2026-01-02T10:00:00",
-                    }
-                }
-            }
-        },
-        404: {"description": "用户未注册密钥"},
-    },
-)
+@app.get("/key/{user_id}", tags=["密钥管理"], summary="查询用户密钥状态")
 async def get_key_info(user_id: str, x_token: str = Header(...)):
     check_token(x_token)
     session = get_session()
@@ -721,16 +664,7 @@ async def get_key_info(user_id: str, x_token: str = Header(...)):
         session.close()
 
 
-@app.delete(
-    "/key/{user_id}",
-    tags=["密钥管理"],
-    summary="删除用户密钥",
-    description="删除后该用户命令将 fallback 到全局 AES_KEY（若已配置），否则发送时报错。",
-    responses={
-        200: {"content": {"application/json": {"example": {"user_id": "user123", "deleted": True}}}},
-        404: {"description": "用户未注册密钥"},
-    },
-)
+@app.delete("/key/{user_id}", tags=["密钥管理"], summary="删除用户密钥")
 async def delete_key(user_id: str, x_token: str = Header(...)):
     check_token(x_token)
     session = get_session()
@@ -755,38 +689,12 @@ async def delete_key(user_id: str, x_token: str = Header(...)):
 # 路由 — 命令发送
 # ══════════════════════════════════════════════════════════════
 
-@app.post(
-    "/send",
-    tags=["命令发送"],
-    summary="提交单条命令",
-    response_description="任务 ID、状态及发送结果",
-    responses={
-        200: {
-            "content": {
-                "application/json": {
-                    "example": {
-                        "id":           "uuid-...",
-                        "cmd_id":       "uuid-...",
-                        "user_id":      "user123",
-                        "command":      "ls -la",
-                        "status":       "sent",
-                        "scheduled_at": None,
-                        "created_at":   "2026-01-01T09:00:00",
-                    }
-                }
-            }
-        },
-        401: {"description": "Token 错误"},
-        404: {"description": "用户未注册密钥"},
-        500: {"description": "MQ 连接失败"},
-    },
-)
+@app.post("/send", tags=["命令发送"], summary="提交单条命令")
 async def send_command(body: SendRequest, x_token: str = Header(...)):
     check_token(x_token)
 
     session = get_session()
     try:
-        # 提前验证用户密钥存在，快速失败
         get_user_aes_key_b64(body.user_id, session)
 
         scheduled = (
@@ -807,7 +715,6 @@ async def send_command(body: SendRequest, x_token: str = Header(...)):
         session.commit()
         session.refresh(task)
 
-        # 无计划时间则立即发送，不等下次轮询
         if not scheduled:
             try:
                 cmd_id       = send_encrypted_command(task, session)
@@ -836,13 +743,7 @@ async def send_command(body: SendRequest, x_token: str = Header(...)):
         session.close()
 
 
-@app.post(
-    "/send/batch",
-    tags=["命令发送"],
-    summary="批量提交命令",
-    description="最多 50 条，写入数据库后立即发送（无 scheduled_at）或等待计划时间。",
-    response_description="每条命令的发送状态",
-)
+@app.post("/send/batch", tags=["命令发送"], summary="批量提交命令")
 async def send_batch(body: BatchSendRequest, x_token: str = Header(...)):
     check_token(x_token)
 
@@ -895,12 +796,7 @@ async def send_batch(body: BatchSendRequest, x_token: str = Header(...)):
 # 路由 — 任务管理
 # ══════════════════════════════════════════════════════════════
 
-@app.get(
-    "/tasks",
-    tags=["任务管理"],
-    summary="查询任务列表",
-    description="支持按 `status`（pending/sent/failed）和 `user_id` 过滤，支持分页。",
-)
+@app.get("/tasks", tags=["任务管理"], summary="查询任务列表")
 async def list_tasks(
     status:  Optional[str] = None,
     user_id: Optional[str] = None,
@@ -940,12 +836,7 @@ async def list_tasks(
         session.close()
 
 
-@app.get(
-    "/tasks/{task_id}",
-    tags=["任务管理"],
-    summary="查询单条任务",
-    responses={404: {"description": "任务不存在"}},
-)
+@app.get("/tasks/{task_id}", tags=["任务管理"], summary="查询单条任务")
 async def get_task(task_id: str, x_token: str = Header(...)):
     check_token(x_token)
     session = get_session()
@@ -971,16 +862,7 @@ async def get_task(task_id: str, x_token: str = Header(...)):
         session.close()
 
 
-@app.post(
-    "/tasks/{task_id}/retry",
-    tags=["任务管理"],
-    summary="手动重试失败任务",
-    description="将 `failed` 或 `pending` 状态的任务重置后立即尝试重新发送。",
-    responses={
-        400: {"description": "任务状态不允许重试"},
-        404: {"description": "任务不存在"},
-    },
-)
+@app.post("/tasks/{task_id}/retry", tags=["任务管理"], summary="手动重试失败任务")
 async def retry_task(task_id: str, x_token: str = Header(...)):
     check_token(x_token)
     session = get_session()
@@ -1017,12 +899,7 @@ async def retry_task(task_id: str, x_token: str = Header(...)):
 # 路由 — 轮询控制
 # ══════════════════════════════════════════════════════════════
 
-@app.post(
-    "/poll/trigger",
-    tags=["轮询控制"],
-    summary="手动触发数据库轮询",
-    description="立即执行一次 `poll_and_send()`，无需等待下一个定时周期。",
-)
+@app.post("/poll/trigger", tags=["轮询控制"], summary="手动触发数据库轮询")
 async def trigger_poll(x_token: str = Header(...)):
     check_token(x_token)
     import asyncio
@@ -1034,12 +911,7 @@ async def trigger_poll(x_token: str = Header(...)):
 # 路由 — 系统
 # ══════════════════════════════════════════════════════════════
 
-@app.get(
-    "/health",
-    tags=["系统"],
-    summary="健康检查",
-    response_description="MQ、数据库连接状态及下次轮询时间",
-)
+@app.get("/health", tags=["系统"], summary="健康检查")
 async def health():
     mq_ok = db_ok = False
     try:
@@ -1066,15 +938,7 @@ async def health():
     }
 
 
-@app.post(
-    "/gen-key",
-    tags=["系统"],
-    summary="生成随机 AES-256 密钥",
-    description=(
-        "生成一个新的 32 字节随机密钥（base64 编码），可用于 `AES_KEY` 全局环境变量。"
-        "注意：此接口生成的是**随机** key，与 `/key/register` 的**派生** key 无关。"
-    ),
-)
+@app.post("/gen-key", tags=["系统"], summary="生成随机 AES-256 密钥")
 async def gen_key(x_token: str = Header(...)):
     check_token(x_token)
     key = os.urandom(32)
@@ -1100,7 +964,6 @@ if __name__ == "__main__":
     if not AES_KEY_B64:
         log.info("提示：未配置全局 AES_KEY，所有用户需先调用 POST /key/register 注册专属密钥")
 
-    # 兼容 Python 3.13 + PyCharm 调试器，避免 loop_factory 冲突
     config = uvicorn.Config(app, host=API_HOST, port=API_PORT, log_level="warning")
     server = uvicorn.Server(config)
     asyncio.run(server.serve())

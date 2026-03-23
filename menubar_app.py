@@ -19,16 +19,20 @@ Shell Agent — 菜单栏管理 App
 import rumps
 import subprocess
 import webbrowser
-import os
 import time
 
-LABEL   = "com.shellagent"
-PLIST   = "/Library/LaunchDaemons/com.shellagent.plist"
-BIN     = "/usr/local/bin/shellagent"
-LOG     = "/var/log/shellagent.log"
-WEB_DIR = "/usr/local/share/shellagent/console.html"
+from config import (
+    AGENT_PORT,
+    MENUBAR_LABEL  as LABEL,
+    MENUBAR_PLIST  as PLIST,
+    MENUBAR_BIN    as BIN,
+    MENUBAR_LOG    as LOG,
+    MENUBAR_WEB_DIR as WEB_DIR,
+    MENUBAR_POLL_INTERVAL,
+)
 
-# 从 plist 读取端口
+
+# 从 plist 读取端口（运行时实际值，优先于 config.py 默认值）
 def _read_port() -> str:
     try:
         out = subprocess.check_output(
@@ -40,7 +44,7 @@ def _read_port() -> str:
                 return line.split("=")[-1].strip().strip('";')
     except Exception:
         pass
-    return "8000"
+    return str(AGENT_PORT)
 
 PORT = _read_port()
 
@@ -78,8 +82,8 @@ class ShellAgentApp(rumps.App):
         ]
         self.menu["Shell Agent"].set_callback(None)
 
-        # 后台轮询状态，每 5 秒刷新一次
-        self._timer = rumps.Timer(self._poll_status, 5)
+        # 后台轮询状态
+        self._timer = rumps.Timer(self._poll_status, MENUBAR_POLL_INTERVAL)
         self._timer.start()
         self._poll_status(None)
 
@@ -87,11 +91,7 @@ class ShellAgentApp(rumps.App):
     def _poll_status(self, _):
         running = _is_running()
         self._update_icon(running)
-        status_item = self.menu["● 状态检查中…"] \
-                   or self.menu.get("● 运行中") \
-                   or self.menu.get("○ 已停止")
 
-        # 重命名状态菜单项
         for key in ["● 状态检查中…", "● 运行中", "○ 已停止"]:
             if key in self.menu:
                 item = self.menu[key]
@@ -102,7 +102,6 @@ class ShellAgentApp(rumps.App):
     def _update_icon(self, running: bool = None):
         if running is None:
             running = _is_running()
-        # macOS 菜单栏 title 支持 emoji
         self.title = "🟢" if running else "🔴"
 
     # ── 服务控制 ──────────────────────────────────────────────
@@ -143,7 +142,6 @@ class ShellAgentApp(rumps.App):
     # ── 快捷操作 ──────────────────────────────────────────────
     @rumps.clicked("🌐  打开控制台")
     def open_console(self, _):
-        # 统一通过 HTTP 访问，避免 file:// 权限问题
         webbrowser.open(f"http://localhost:{PORT}/console")
 
     @rumps.clicked("📋  查看日志")

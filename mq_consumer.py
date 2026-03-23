@@ -11,16 +11,6 @@ Shell Agent — RabbitMQ 消费者模块
 
 用法：
     python3 mq_consumer.py
-
-环境变量：
-    MQ_HOST        RabbitMQ host         (默认 localhost)
-    MQ_PORT        RabbitMQ port         (默认 5672)
-    MQ_USER        RabbitMQ username     (默认 guest)
-    MQ_PASS        RabbitMQ password     (默认 guest)
-    MQ_VHOST       RabbitMQ vhost        (默认 /)
-    MQ_USER_ID     当前 agent 的用户ID   (必填)
-    SECRET_KEY     原始密钥（与 App 端输入一致），优先使用   (与 AES_KEY 二选一)
-    AES_KEY        AES-256 密钥 base64   (兼容旧版，SECRET_KEY 未设置时使用)
 """
 
 import os
@@ -39,6 +29,21 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
 
+from config import (
+    MQ_HOST,
+    MQ_PORT,
+    MQ_USER,
+    MQ_PASS,
+    MQ_VHOST,
+    MQ_USER_ID     as USER_ID,
+    SECRET_KEY,
+    AES_KEY_B64,
+    AGENT_PORT,
+    AGENT_TOKEN,
+    OUTPUT_ENCODING,
+    BLOCKED_KEYWORDS,
+)
+
 # ─── 日志 ────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
@@ -47,27 +52,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("mq_consumer")
 
-# ─── 配置 ────────────────────────────────────────────────────
-MQ_HOST     = os.getenv("MQ_HOST",    "10.17.1.17")
-MQ_PORT     = int(os.getenv("MQ_PORT", "5672"))
-MQ_USER     = os.getenv("MQ_USER",    "admin")
-MQ_PASS     = os.getenv("MQ_PASS",    "admin123")
-MQ_VHOST    = os.getenv("MQ_VHOST",  "/")
-USER_ID     = os.getenv("MQ_USER_ID", "")
-
-SECRET_KEY  = os.getenv("SECRET_KEY", "")    # 优先：原始密钥，与 App 端输入一致
-AES_KEY_B64 = os.getenv("AES_KEY",   "")    # 兼容旧版：直接传 base64 AES key
-
-AGENT_PORT  = int(os.getenv("AGENT_PORT", "8000"))
-AGENT_TOKEN = os.getenv("AGENT_TOKEN", "my-secret-token")
-
 # queue 命名规则
-QUEUE_CMD    = f"agent.{USER_ID}"       # 消费：接收命令
-QUEUE_RESULT = f"result.{USER_ID}"     # 默认回写队列
+QUEUE_CMD    = f"agent.{USER_ID}"   # 消费：接收命令
+QUEUE_RESULT = f"result.{USER_ID}"  # 默认回写队列
 
-OUTPUT_ENCODING = "utf-8"
-
-BLOCKED_KEYWORDS = ["rm -rf /", "rm -rf ~", ":(){ :|:& };:", "mkfs", "dd if="]
 
 # ─── 密钥派生（与 Producer 端完全一致）───────────────────────
 
@@ -86,9 +74,9 @@ def derive_aes_key(secret_key: str) -> bytes:
 def _resolve_aes_key() -> bytes:
     """
     密钥解析优先级：
-      1. SECRET_KEY 环境变量 → 本地派生（推荐）
-      2. AES_KEY 环境变量   → 直接 base64 解码（兼容旧版）
-      3. 两者都未设置        → 报错退出
+      1. SECRET_KEY  → 本地派生（推荐）
+      2. AES_KEY_B64 → 直接 base64 解码（兼容旧版）
+      3. 两者都未设置 → 报错退出
     """
     if SECRET_KEY:
         key     = derive_aes_key(SECRET_KEY)

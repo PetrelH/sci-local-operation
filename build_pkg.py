@@ -7,20 +7,20 @@ Shell Agent — macOS .pkg 打包脚本
 
 import os
 import sys
-import stat
 import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
-# ── 配置 ──────────────────────────────────────────────────────
-APP_NAME       = "ShellAgent"
-PKG_IDENTIFIER = "com.shellagent.agent"
-VERSION        = "1.0.0"
-MIN_MACOS      = "12.0"
-PKG_OUT        = f"{APP_NAME}-{VERSION}.pkg"
+from config import (
+    APP_NAME,
+    PKG_IDENTIFIER,
+    PKG_VERSION    as VERSION,
+    MIN_MACOS,
+)
 
-ROOT = Path(__file__).parent.resolve()
+PKG_OUT = f"{APP_NAME}-{VERSION}.pkg"
+ROOT    = Path(__file__).parent.resolve()
 
 # ── 工具函数 ──────────────────────────────────────────────────
 def step(n, total, msg):
@@ -58,7 +58,7 @@ try:
 except subprocess.CalledProcessError:
     die("未找到 rumps，请运行：pip install rumps pyobjc-framework-Cocoa")
 
-for f in ["agent.py", "menubar_app.py"]:
+for f in ["agent.py", "menubar_app.py", "config.py"]:
     if not (ROOT / f).exists():
         die(f"未找到 {f}，请在项目根目录运行此脚本")
 
@@ -86,6 +86,8 @@ hidden = [
 cmd = [
     "pyinstaller", "--noconfirm", "--onefile", "--name", "shellagent",
     *[arg for h in hidden for arg in ("--hidden-import", h)],
+    # 将 config.py 一并打包
+    "--add-data", "config.py:.",
 ]
 if (ROOT / "console.html").exists():
     cmd += ["--add-data", "console.html:."]
@@ -112,6 +114,7 @@ run(
     "--name", "ShellAgentMenu",
     "--osx-bundle-identifier", "com.shellagent.menu",
     "--add-binary", f"{rumps_dir}/:rumps/",
+    "--add-data", "config.py:.",
     "menubar_app.py",
     cwd=ROOT,
 )
@@ -143,7 +146,7 @@ menu_dst = app_bundle / "MacOS/ShellAgentMenu"
 shutil.copy2(menu_bin, menu_dst)
 menu_dst.chmod(0o755)
 
-write(app_bundle / "Info.plist", """\
+write(app_bundle / "Info.plist", f"""\
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
       "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -153,12 +156,12 @@ write(app_bundle / "Info.plist", """\
       <key>CFBundleIdentifier</key><string>com.shellagent.menu</string>
       <key>CFBundleName</key><string>ShellAgentMenu</string>
       <key>CFBundleDisplayName</key><string>Shell Agent</string>
-      <key>CFBundleVersion</key><string>1.0.0</string>
-      <key>CFBundleShortVersionString</key><string>1.0.0</string>
+      <key>CFBundleVersion</key><string>{VERSION}</string>
+      <key>CFBundleShortVersionString</key><string>{VERSION}</string>
       <key>CFBundlePackageType</key><string>APPL</string>
       <key>LSUIElement</key><true/>
       <key>NSHighResolutionCapable</key><true/>
-      <key>LSMinimumSystemVersion</key><string>12.0</string>
+      <key>LSMinimumSystemVersion</key><string>{MIN_MACOS}</string>
     </dict>
     </plist>
 """)
@@ -470,7 +473,6 @@ step(7, 7, "打包")
 COMPONENT_PKG = ROOT / "component.pkg"
 DIST_XML      = ROOT / "distribution.xml"
 
-# distribution.xml
 DIST_XML.write_text(f"""\
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">

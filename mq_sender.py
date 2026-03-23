@@ -23,6 +23,15 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding
 from cryptography.hazmat.backends import default_backend
 
+from config import (
+    MQ_HOST,
+    MQ_PORT,
+    MQ_USER,
+    MQ_PASS,
+    MQ_VHOST,
+    AES_KEY_B64,
+)
+
 
 # ─── AES-256-CBC 加解密（与 mq_consumer.py 完全一致）────────────────
 
@@ -54,24 +63,24 @@ def aes_decrypt(payload: dict, key_b64: str) -> str:
 # ─── 发送命令 ─────────────────────────────────────────────────
 
 def send_command(
-    user_id: str,
-    command: str,
-    aes_key: str,
-    mq_host: str = "localhost",
-    mq_port: int = 5672,
-    mq_user: str = "guest",
-    mq_pass: str = "guest",
-    mq_vhost: str = "/",
-    timeout: int = 30,
-    reply_to: str = None,
+    user_id:     str,
+    command:     str,
+    aes_key:     str,
+    mq_host:     str  = MQ_HOST,
+    mq_port:     int  = MQ_PORT,
+    mq_user:     str  = MQ_USER,
+    mq_pass:     str  = MQ_PASS,
+    mq_vhost:    str  = MQ_VHOST,
+    timeout:     int  = 30,
+    reply_to:    str  = None,
     wait_result: bool = True,
 ) -> dict | None:
     """
     加密命令并发送到 agent.{user_id} 队列
     wait_result=True 时阻塞等待结果（最多 timeout+5 秒）
     """
-    cmd_id   = str(uuid.uuid4())
-    queue_cmd = f"agent.{user_id}"
+    cmd_id      = str(uuid.uuid4())
+    queue_cmd   = f"agent.{user_id}"
     reply_queue = reply_to or f"result.{user_id}"
 
     # 构造消息
@@ -93,7 +102,7 @@ def send_command(
         credentials=credentials,
         heartbeat=30,
     )
-    conn = pika.BlockingConnection(params)
+    conn    = pika.BlockingConnection(params)
     channel = conn.channel()
 
     # 确保队列存在
@@ -129,7 +138,6 @@ def send_command(
     while time.time() < deadline:
         method_frame, props, body = channel.basic_get(queue=reply_queue, auto_ack=False)
         if method_frame:
-            # 检查 correlation_id 匹配
             if props.correlation_id == cmd_id:
                 try:
                     encrypted_result = json.loads(body.decode("utf-8"))
@@ -166,21 +174,21 @@ def send_command(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Shell Agent MQ 发送端")
-    parser.add_argument("--user",    required=True,  help="目标用户ID")
-    parser.add_argument("--cmd",     required=True,  help="要执行的 shell 命令")
-    parser.add_argument("--key",     default=os.getenv("AES_KEY", ""), help="AES-256 密钥 base64")
-    parser.add_argument("--host",    default=os.getenv("MQ_HOST", "10.17.1.17"))
-    parser.add_argument("--port",    default=int(os.getenv("MQ_PORT", "5672")), type=int)
-    parser.add_argument("--mq-user", default=os.getenv("MQ_USER", "guest"))
-    parser.add_argument("--mq-pass", default=os.getenv("MQ_PASS", "guest"))
-    parser.add_argument("--vhost",   default=os.getenv("MQ_VHOST", "/"))
-    parser.add_argument("--timeout", default=30, type=int)
-    parser.add_argument("--reply",   default=None, help="结果回写队列（默认 result.{user_id}）")
-    parser.add_argument("--no-wait", action="store_true", help="不等待结果，fire and forget")
+    parser.add_argument("--user",    required=True,            help="目标用户ID")
+    parser.add_argument("--cmd",     required=True,            help="要执行的 shell 命令")
+    parser.add_argument("--key",     default=AES_KEY_B64,      help="AES-256 密钥 base64")
+    parser.add_argument("--host",    default=MQ_HOST)
+    parser.add_argument("--port",    default=MQ_PORT,          type=int)
+    parser.add_argument("--mq-user", default=MQ_USER)
+    parser.add_argument("--mq-pass", default=MQ_PASS)
+    parser.add_argument("--vhost",   default=MQ_VHOST)
+    parser.add_argument("--timeout", default=30,               type=int)
+    parser.add_argument("--reply",   default=None,             help="结果回写队列（默认 result.{user_id}）")
+    parser.add_argument("--no-wait", action="store_true",      help="不等待结果，fire and forget")
     args = parser.parse_args()
 
     if not args.key:
-        print("❌  请设置 AES_KEY 环境变量或通过 --key 传入")
+        print("❌  请设置 AES_KEY 环境变量（或在 config.py 中配置 AES_KEY_B64），或通过 --key 传入")
         exit(1)
 
     send_command(
