@@ -49,7 +49,7 @@ AES_KEY_B64 = os.getenv("AES_KEY",    "")
 # MQ Consumer 配置（mq_consumer.py）
 # ══════════════════════════════════════════════════════════════
 
-MQ_USER_ID = os.getenv("MQ_USER_ID", "")
+MQ_USER_ID = os.getenv("MQ_USER_ID", "user123")
 
 # ══════════════════════════════════════════════════════════════
 # MQ Producer API 配置（mq_producer_api.py）
@@ -82,6 +82,10 @@ MIN_MACOS      = "12.0"
 # ══════════════════════════════════════════════════════════════
 # 菜单栏 App 配置（menubar_app.py）
 # ══════════════════════════════════════════════════════════════
+
+# Producer API 地址（用于同步密钥）
+PRODUCER_API_URL   = os.getenv("PRODUCER_API_URL", "http://10.17.1.17:9000")
+PRODUCER_API_TOKEN = os.getenv("PRODUCER_API_TOKEN", "producer-secret")
 
 MENUBAR_LABEL    = "com.shellagent"
 MENUBAR_PLIST    = "/Library/LaunchDaemons/com.shellagent.plist"

@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS t_command_tasks (
 -- App 端调用 POST /key/register { user_id, secret_key }
 -- Consumer 端设置环境变量 SECRET_KEY=<同一个 secret_key>，本地派生，AES key 不经过网络
 -- ══════════════════════════════════════════════════════════════
-CREATE TABLE IF NOT EXISTS user_keys (
+CREATE TABLE IF NOT EXISTS t_user_keys (
     user_id         VARCHAR(64)     NOT NULL                    COMMENT '用户ID，与 command_tasks.user_id 关联',
     secret_key      VARCHAR(255)    NOT NULL                    COMMENT '原始密钥明文（App 端输入，仅服务端存储）',
     aes_key_b64     VARCHAR(255)    NOT NULL                    COMMENT '派生的 AES-256 key（base64），= MD5(secret) ‖ MD5(MD5(secret))',
@@ -65,3 +65,31 @@ CREATE TABLE IF NOT EXISTS user_keys (
   DEFAULT CHARSET=utf8mb4
   COLLATE=utf8mb4_unicode_ci
   COMMENT='用户密钥表：存储 secret_key 原文及派生 AES key';
+
+
+
+-- ══════════════════════════════════════════════════════════════
+-- 命令执行结果表
+-- 存储从 RabbitMQ 接收到的命令执行结果（解密后）
+-- ══════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS t_command_results (
+    id              VARCHAR(36)     NOT NULL                    COMMENT '结果ID（UUID）',
+    cmd_id          VARCHAR(36)     NOT NULL                    COMMENT '命令ID，与 t_command_tasks.cmd_id 关联',
+    user_id         VARCHAR(64)     NOT NULL                    COMMENT '用户ID',
+    stdout          TEXT            NULL                        COMMENT '标准输出',
+    stderr          TEXT            NULL                        COMMENT '标准错误',
+    returncode      INT             NULL                        COMMENT '返回码',
+    duration_ms     INT             NULL                        COMMENT '执行耗时（毫秒）',
+    cwd             VARCHAR(512)    NULL                        COMMENT '执行时的工作目录',
+    raw_result      TEXT            NULL                        COMMENT '原始结果JSON（保留完整信息）',
+    received_at     DATETIME        NOT NULL DEFAULT CURRENT_TIMESTAMP  COMMENT '接收时间',
+
+    PRIMARY KEY (id),
+    UNIQUE INDEX idx_cmd_id     (cmd_id),
+    INDEX idx_user_id           (user_id),
+    INDEX idx_received_at       (received_at)
+
+) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_unicode_ci
+  COMMENT='命令执行结果表：存储从 RabbitMQ 接收的执行结果';

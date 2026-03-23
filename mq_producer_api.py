@@ -101,7 +101,7 @@ Base = declarative_base()
 
 class UserKey(Base):
     """用户密钥表：存储原始 secret_key 及派生的 aes_key_b64"""
-    __tablename__ = "user_keys"
+    __tablename__ = "t_user_keys"
 
     user_id     = Column(String(64),  primary_key=True, comment="用户ID")
     secret_key  = Column(String(255), nullable=False,   comment="原始 secret key")
@@ -134,6 +134,22 @@ class CommandTask(Base):
     created_at   = Column(DateTime,    default=datetime.datetime.now)
     sent_at      = Column(DateTime,    nullable=True)
     scheduled_at = Column(DateTime,    nullable=True, index=True)
+
+
+class CommandResult(Base):
+    """命令执行结果表"""
+    __tablename__ = "t_command_results"
+
+    id           = Column(String(36),  primary_key=True, default=lambda: str(uuid.uuid4()))
+    cmd_id       = Column(String(36),  nullable=False,  index=True, unique=True, comment="命令ID（correlation_id）")
+    user_id      = Column(String(64),  nullable=False,  index=True, comment="用户ID")
+    stdout       = Column(Text,        nullable=True,   comment="标准输出")
+    stderr       = Column(Text,        nullable=True,   comment="标准错误")
+    returncode   = Column(Integer,     nullable=True,   comment="返回码")
+    duration_ms  = Column(Integer,     nullable=True,   comment="执行耗时(毫秒)")
+    cwd          = Column(String(512), nullable=True,   comment="执行时的工作目录")
+    raw_result   = Column(Text,        nullable=True,   comment="原始 JSON 结果")
+    received_at  = Column(DateTime,    default=datetime.datetime.now, comment="结果接收时间")
 
 
 def make_db_url() -> str:
@@ -244,6 +260,40 @@ def get_user_aes_key_b64(user_id: str, session: Session) -> str:
     )
 
 
+def save_result_to_db(user_id: str, result: dict, session: Session) -> bool:
+    """
+    将命令执行结果保存到数据库。
+    如果 cmd_id 已存在则跳过（幂等）。
+    返回: True=新增, False=已存在
+    """
+    cmd_id = result.get("cmd_id")
+    if not cmd_id:
+        log.warning("结果缺少 cmd_id，跳过入库")
+        return False
+
+    # 检查是否已存在
+    existing = session.query(CommandResult).filter(CommandResult.cmd_id == cmd_id).first()
+    if existing:
+        log.debug(f"结果已存在，跳过入库：cmd_id={cmd_id}")
+        return False
+
+    # 新增记录
+    record = CommandResult(
+        cmd_id=cmd_id,
+        user_id=user_id,
+        stdout=result.get("stdout"),
+        stderr=result.get("stderr"),
+        returncode=result.get("returncode"),
+        duration_ms=result.get("duration_ms"),
+        cwd=result.get("cwd"),
+        raw_result=json.dumps(result, ensure_ascii=False),
+    )
+    session.add(record)
+    session.commit()
+    log.info(f"结果已入库：cmd_id={cmd_id}  user_id={user_id}")
+    return True
+
+
 # ══════════════════════════════════════════════════════════════
 # RabbitMQ 客户端
 # ══════════════════════════════════════════════════════════════
@@ -291,6 +341,64 @@ class MQClient:
                 self._conn = None
                 if attempt == 2:
                     raise
+
+    def get_messages(self, queue: str, max_count: int = 10, auto_ack: bool = True) -> list:
+        """
+        从队列中获取消息（非阻塞）
+        返回: [(body_bytes, properties, delivery_tag), ...]
+        """
+        messages = []
+        try:
+            ch = self.channel()
+            ch.queue_declare(queue=queue, durable=True)
+
+            for _ in range(max_count):
+                method, properties, body = ch.basic_get(queue=queue, auto_ack=auto_ack)
+                if method is None:
+                    break
+                messages.append((body, properties, method.delivery_tag))
+
+            return messages
+        except Exception as e:
+            log.error(f"获取消息失败：{e}")
+            self._conn = None
+            raise
+
+    def get_message_by_correlation_id(self, queue: str, correlation_id: str, max_scan: int = 100) -> Optional[tuple]:
+        """
+        根据 correlation_id 查找特定消息
+        返回: (body_bytes, properties) 或 None
+        """
+        try:
+            ch = self.channel()
+            ch.queue_declare(queue=queue, durable=True)
+
+            # 临时存储不匹配的消息，扫描后重新入队
+            unmatched = []
+            result = None
+
+            for _ in range(max_scan):
+                method, properties, body = ch.basic_get(queue=queue, auto_ack=False)
+                if method is None:
+                    break
+
+                if properties.correlation_id == correlation_id:
+                    ch.basic_ack(delivery_tag=method.delivery_tag)
+                    result = (body, properties)
+                    break
+                else:
+                    # 不匹配的消息暂存，稍后重新入队
+                    unmatched.append((body, properties, method.delivery_tag))
+
+            # 将不匹配的消息 nack（重新入队）
+            for _, _, delivery_tag in unmatched:
+                ch.basic_nack(delivery_tag=delivery_tag, requeue=True)
+
+            return result
+        except Exception as e:
+            log.error(f"查找消息失败：{e}")
+            self._conn = None
+            raise
 
     def close(self):
         with self._lock:
@@ -526,6 +634,7 @@ async def lifespan(app: FastAPI):
 tags_metadata = [
     {"name": "密钥管理", "description": "注册/更新/验证/删除用户密钥，派生规则：MD5(secret) ‖ MD5(MD5(secret))。"},
     {"name": "命令发送", "description": "手动提交命令，加密后立即或按计划发送到 RabbitMQ。"},
+    {"name": "结果获取", "description": "从结果队列获取命令执行结果并解密返回。"},
     {"name": "任务管理", "description": "查询、重试数据库中的命令任务，状态流转：pending → sent / failed。"},
     {"name": "轮询控制", "description": "手动触发数据库轮询，无需等待下一个定时周期。"},
     {"name": "系统",     "description": "健康检查、AES 密钥生成等工具接口。"},
@@ -790,6 +899,269 @@ async def send_batch(body: BatchSendRequest, x_token: str = Header(...)):
         session.close()
 
     return {"total": len(results), "results": results}
+
+
+# ══════════════════════════════════════════════════════════════
+# 路由 — 结果获取
+# ══════════════════════════════════════════════════════════════
+
+@app.get(
+    "/result/{user_id}",
+    tags=["结果获取"],
+    summary="获取用户的命令执行结果",
+    description="""
+从 `result.{user_id}` 队列中获取命令执行结果，自动解密后返回并入库。
+
+- `max_count`: 最多获取多少条消息（默认 10）
+- `auto_ack`: 是否自动确认消息（默认 True，确认后消息从队列中删除）
+- 结果会自动保存到 `t_command_results` 表
+""",
+)
+async def get_results(
+    user_id: str,
+    max_count: int = 10,
+    auto_ack: bool = True,
+    x_token: str = Header(...),
+):
+    check_token(x_token)
+
+    session = get_session()
+    try:
+        # 获取用户的 AES key
+        key_b64 = get_user_aes_key_b64(user_id, session)
+
+        # 从结果队列获取消息
+        queue = f"result.{user_id}"
+        messages = mq.get_messages(queue, max_count=max_count, auto_ack=auto_ack)
+
+        results = []
+        saved_count = 0
+        for body, properties, delivery_tag in messages:
+            try:
+                # 解析加密载体
+                envelope = json.loads(body.decode("utf-8"))
+
+                # AES 解密
+                plaintext = aes_decrypt(envelope, key_b64)
+
+                # 解析结果 JSON
+                result = json.loads(plaintext)
+                result["_correlation_id"] = properties.correlation_id
+                results.append(result)
+
+                # 入库
+                if save_result_to_db(user_id, result, session):
+                    saved_count += 1
+
+            except Exception as e:
+                log.error(f"解密结果失败：{e}")
+                results.append({
+                    "_error": str(e),
+                    "_correlation_id": properties.correlation_id if properties else None,
+                    "_raw": body.decode("utf-8", errors="replace")[:200],
+                })
+
+        return {
+            "user_id": user_id,
+            "queue": queue,
+            "count": len(results),
+            "saved_count": saved_count,
+            "results": results,
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取结果失败：{e}")
+    finally:
+        session.close()
+
+
+@app.get(
+    "/result/{user_id}/history",
+    tags=["结果获取"],
+    summary="查询历史执行结果（从数据库）",
+    description="""
+从数据库中查询已入库的命令执行结果历史记录。
+""",
+)
+async def get_result_history(
+    user_id: str,
+    limit: int = 20,
+    offset: int = 0,
+    cmd_id: Optional[str] = None,
+    x_token: str = Header(...),
+):
+    check_token(x_token)
+
+    session = get_session()
+    try:
+        q = session.query(CommandResult).filter(CommandResult.user_id == user_id)
+
+        if cmd_id:
+            q = q.filter(CommandResult.cmd_id == cmd_id)
+
+        total = q.count()
+        records = q.order_by(CommandResult.received_at.desc()).limit(limit).offset(offset).all()
+
+        return {
+            "user_id": user_id,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "results": [
+                {
+                    "id": r.id,
+                    "cmd_id": r.cmd_id,
+                    "stdout": r.stdout,
+                    "stderr": r.stderr,
+                    "returncode": r.returncode,
+                    "duration_ms": r.duration_ms,
+                    "cwd": r.cwd,
+                    "received_at": r.received_at.isoformat() if r.received_at else None,
+                }
+                for r in records
+            ],
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"查询历史结果失败：{e}")
+    finally:
+        session.close()
+
+
+@app.get(
+    "/result/{user_id}/peek",
+    tags=["结果获取"],
+    summary="预览结果队列（不消费）",
+    description="""
+预览 `result.{user_id}` 队列中的消息，不会从队列中删除消息。
+用于检查是否有待处理的结果。
+""",
+)
+async def peek_results(
+    user_id: str,
+    max_count: int = 10,
+    x_token: str = Header(...),
+):
+    check_token(x_token)
+
+    session = get_session()
+    try:
+        key_b64 = get_user_aes_key_b64(user_id, session)
+        queue = f"result.{user_id}"
+
+        # 获取消息但不确认（auto_ack=False）
+        ch = mq.channel()
+        ch.queue_declare(queue=queue, durable=True)
+
+        results = []
+        delivery_tags = []
+
+        for _ in range(max_count):
+            method, properties, body = ch.basic_get(queue=queue, auto_ack=False)
+            if method is None:
+                break
+
+            delivery_tags.append(method.delivery_tag)
+
+            try:
+                envelope = json.loads(body.decode("utf-8"))
+                plaintext = aes_decrypt(envelope, key_b64)
+                result = json.loads(plaintext)
+                result["_correlation_id"] = properties.correlation_id
+                results.append(result)
+            except Exception as e:
+                results.append({
+                    "_error": str(e),
+                    "_correlation_id": properties.correlation_id if properties else None,
+                })
+
+        # 将所有消息重新放回队列
+        for tag in delivery_tags:
+            ch.basic_nack(delivery_tag=tag, requeue=True)
+
+        return {
+            "user_id": user_id,
+            "queue": queue,
+            "count": len(results),
+            "results": results,
+            "_note": "预览模式：消息未从队列中删除",
+        }
+
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"预览结果失败：{e}")
+    finally:
+        session.close()
+
+
+@app.get(
+    "/result/{user_id}/{cmd_id}",
+    tags=["结果获取"],
+    summary="获取特定命令的执行结果",
+    description="""
+根据 `cmd_id`（correlation_id）从结果队列中查找特定命令的执行结果。
+
+- 会扫描队列中的消息（最多 100 条），找到匹配的 cmd_id 后返回
+- 不匹配的消息会被重新放回队列
+- 如果找不到对应结果，返回 404
+""",
+)
+async def get_result_by_cmd_id(
+    user_id: str,
+    cmd_id: str,
+    x_token: str = Header(...),
+):
+    check_token(x_token)
+
+    session = get_session()
+    try:
+        # 获取用户的 AES key
+        key_b64 = get_user_aes_key_b64(user_id, session)
+
+        # 从结果队列查找特定消息
+        queue = f"result.{user_id}"
+        message = mq.get_message_by_correlation_id(queue, cmd_id)
+
+        if message is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"未找到 cmd_id={cmd_id} 的执行结果（可能尚未执行完成或已被消费）"
+            )
+
+        body, properties = message
+        try:
+            # 解析加密载体
+            envelope = json.loads(body.decode("utf-8"))
+
+            # AES 解密
+            plaintext = aes_decrypt(envelope, key_b64)
+
+            # 解析结果 JSON
+            result = json.loads(plaintext)
+            result["_correlation_id"] = properties.correlation_id
+
+            return {
+                "user_id": user_id,
+                "cmd_id": cmd_id,
+                "queue": queue,
+                "result": result,
+            }
+
+        except Exception as e:
+            log.error(f"解密结果失败：{e}")
+            raise HTTPException(status_code=500, detail=f"解密结果失败：{e}")
+
+    except HTTPException:
+        raise
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取结果失败：{e}")
+    finally:
+        session.close()
 
 
 # ══════════════════════════════════════════════════════════════

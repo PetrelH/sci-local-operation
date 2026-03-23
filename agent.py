@@ -22,6 +22,7 @@ import platform
 import datetime
 import sys
 import pathlib
+import threading
 
 from config import (
     AGENT_TOKEN as TOKEN,
@@ -29,6 +30,9 @@ from config import (
     AGENT_PORT  as PORT,
     OUTPUT_ENCODING,
     BLOCKED_KEYWORDS,
+    MQ_USER_ID,
+    SECRET_KEY,
+    AES_KEY_B64,
 )
 
 # ─── 持久化工作目录 ───────────────────────────────────────────
@@ -401,12 +405,37 @@ async def system_info(x_token: str = Header(...)):
     }
 
 
+# ─── MQ 消费者后台线程 ────────────────────────────────────────
+def start_mq_consumer_thread():
+    """在后台线程中启动 MQ 消费者"""
+    if not MQ_USER_ID:
+        log("WARN", "MQ_USER_ID 未设置，跳过 RabbitMQ 消费者")
+        return
+
+    if not SECRET_KEY and not AES_KEY_B64:
+        log("WARN", "SECRET_KEY 未设置，跳过 RabbitMQ 消费者")
+        return
+
+    try:
+        from mq_consumer import start_consumer
+        log("INFO", f"启动 RabbitMQ 消费者线程（用户: {MQ_USER_ID}）")
+        thread = threading.Thread(target=start_consumer, daemon=True)
+        thread.start()
+    except ImportError as e:
+        log("WARN", f"无法导入 mq_consumer 模块：{e}")
+    except Exception as e:
+        log("ERROR", f"启动 MQ 消费者失败：{e}")
+
+
 # ─── 启动（兼容 Python 3.13 + PyCharm 调试器）────────────────
 if __name__ == "__main__":
     log("INFO", f"Shell Agent starting on {HOST}:{PORT}")
     log("INFO", f"Token: {TOKEN[:4]}{'*' * (len(TOKEN) - 4)}")
     log("INFO", f"Initial cwd: {get_cwd()}")
     log("INFO", f"Console: http://localhost:{PORT}/console")
+
+    # 启动 MQ 消费者（如果配置了）
+    start_mq_consumer_thread()
 
     config = uvicorn.Config(app, host=HOST, port=PORT, log_level="warning")
     server = uvicorn.Server(config)

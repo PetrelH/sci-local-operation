@@ -82,12 +82,18 @@ hidden = [
     "uvicorn.protocols", "uvicorn.protocols.http", "uvicorn.protocols.http.auto",
     "uvicorn.protocols.websockets", "uvicorn.protocols.websockets.auto",
     "uvicorn.lifespan", "uvicorn.lifespan.on",
+    # MQ 消费者依赖
+    "pika", "pika.adapters", "pika.adapters.blocking_connection",
+    "cryptography", "cryptography.hazmat", "cryptography.hazmat.primitives",
+    "cryptography.hazmat.primitives.ciphers", "cryptography.hazmat.backends",
+    "mq_consumer",
 ]
 cmd = [
     "pyinstaller", "--noconfirm", "--onefile", "--name", "shellagent",
     *[arg for h in hidden for arg in ("--hidden-import", h)],
-    # 将 config.py 一并打包
+    # 将 config.py 和 mq_consumer.py 一并打包
     "--add-data", "config.py:.",
+    "--add-data", "mq_consumer.py:.",
 ]
 if (ROOT / "console.html").exists():
     cmd += ["--add-data", "console.html:."]
@@ -187,6 +193,8 @@ write(PKG_ROOT / "Library/LaunchDaemons/com.shellagent.plist", """\
         <key>AGENT_TOKEN</key><string>__TOKEN__</string>
         <key>AGENT_HOST</key><string>0.0.0.0</string>
         <key>AGENT_PORT</key><string>__PORT__</string>
+        <key>SECRET_KEY</key><string>__AESKEY__</string>
+        <key>MQ_USER_ID</key><string>__USERID__</string>
       </dict>
       <key>RunAtLoad</key><true/>
       <key>KeepAlive</key><true/>
@@ -240,26 +248,22 @@ write(SCRIPTS_DIR / "preinstall", """\
 
 write(SCRIPTS_DIR / "postinstall", """\
     #!/bin/bash
-    # postinstall：写入配置 → 启动服务 → 验证启动成功
+    # postinstall：写入默认配置 → 启动服务
+    # 注意：AES 密钥等配置由菜单栏 App 首次启动时弹窗收集
     set -e
 
     DAEMON_PLIST="/Library/LaunchDaemons/com.shellagent.plist"
     AGENT_PLIST="/Library/LaunchAgents/com.shellagent.menu.plist"
-    CONF="/private/tmp/shellagent_install.conf"
     LOG="/var/log/shellagent-install.log"
 
     log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
     log "=== Shell Agent postinstall 开始 ==="
 
-    # 读取用户配置
-    if [ -f "$CONF" ]; then
-      TOKEN=$(grep '^TOKEN=' "$CONF" | cut -d= -f2- | tr -d '\\n\\r"' || true)
-      PORT=$(grep  '^PORT='  "$CONF" | cut -d= -f2- | tr -d '\\n\\r"' || true)
-      rm -f "$CONF"
-      log "从配置文件读取：PORT=${PORT}"
-    fi
-    TOKEN="${TOKEN:-my-secret-token}"
-    PORT="${PORT:-8000}"
+    # 使用默认配置（实际配置由菜单栏 App 首次启动时收集）
+    TOKEN="my-secret-token"
+    AESKEY=""
+    PORT="8000"
+    USERID=""
 
     if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1024 ] || [ "$PORT" -gt 65535 ]; then
       log "端口号无效，回退到 8000"; PORT="8000"
@@ -267,8 +271,10 @@ write(SCRIPTS_DIR / "postinstall", """\
 
     # 写入 plist
     sed -i '' "s/__TOKEN__/${TOKEN}/g" "$DAEMON_PLIST"
+    sed -i '' "s/__AESKEY__/${AESKEY}/g" "$DAEMON_PLIST"
     sed -i '' "s/__PORT__/${PORT}/g"   "$DAEMON_PLIST"
-    log "配置写入完成：TOKEN=***  PORT=${PORT}"
+    sed -i '' "s/__USERID__/${USERID}/g" "$DAEMON_PLIST"
+    log "配置写入完成：TOKEN=***  AESKEY=***  PORT=${PORT}  USERID=${USERID}"
 
     # 修复权限
     chown root:wheel "$DAEMON_PLIST" /usr/local/bin/shellagent
@@ -352,72 +358,33 @@ write(RES_DIR / "welcome.html", """\
         <li>🟢 菜单栏图标 App，随时查看状态、一键启停、打开控制台</li>
         <li>🌐 浏览器 Web 控制台，远程执行 Shell 命令</li>
       </ul>
-      <p style="margin-top:12px">点击「继续」设置访问 <strong>Token</strong> 和<strong>端口号</strong>。</p>
+      <p style="margin-top:12px">点击「继续」设置访问 <strong>Token</strong>、<strong>AES 加密密钥</strong>和<strong>端口号</strong>。</p>
     </body></html>
 """)
 
 write(RES_DIR / "config.html", """\
     <!DOCTYPE html><html><head><meta charset="utf-8">
     <style>
-      * { box-sizing:border-box; margin:0; padding:0; }
-      body { font-family:-apple-system,sans-serif; padding:20px 24px; color:#1d1d1f; background:#fff; }
-      h2   { font-size:15px; font-weight:600; margin-bottom:6px; }
-      .sub { font-size:12px; color:#666; margin-bottom:16px; }
-      .field      { margin-bottom:14px; }
-      label       { display:block; font-size:12px; font-weight:500; color:#555; margin-bottom:4px; }
-      input       { width:100%; padding:7px 10px; border:1px solid #c7c7cc; border-radius:6px; font-size:13px; outline:none; }
-      input:focus { border-color:#0071e3; }
-      .hint       { font-size:11px; color:#888; margin-top:3px; }
-      hr          { border:none; border-top:1px solid #e5e5ea; margin:14px 0; }
-      #save-btn   { padding:7px 18px; background:#0071e3; color:#fff; border:none; border-radius:6px; font-size:13px; font-weight:500; cursor:pointer; }
-      #save-btn:hover  { background:#0077ed; }
-      #save-btn.saved  { background:#34c759; cursor:default; }
-      #msg  { font-size:12px; margin-top:10px; min-height:16px; }
-      .err  { color:#c0392b; } .ok { color:#27ae60; }
-      .note { font-size:11px; color:#888; line-height:1.6; background:#f9f9fb; border-radius:6px; padding:8px 10px; }
-      code  { font-family:monospace; font-size:11px; background:#eee; padding:1px 4px; border-radius:3px; }
+      body { font-family:-apple-system,sans-serif; padding:20px 24px; color:#1d1d1f; }
+      h2   { font-size:17px; font-weight:600; margin:0 0 14px; }
+      p    { font-size:13px; line-height:1.8; color:#3d3d3d; margin:0 0 12px; }
+      .highlight { background:#fff3cd; padding:12px 14px; border-radius:8px; border-left:4px solid #ffc107; margin:16px 0; }
+      .highlight strong { color:#856404; }
+      ul   { font-size:13px; line-height:2; color:#3d3d3d; padding-left:20px; margin:10px 0; }
+      code { font-family:monospace; font-size:12px; background:#f2f2f7; padding:2px 6px; border-radius:4px; }
     </style></head>
     <body>
-      <h2>配置 Shell Agent</h2>
-      <p class="sub">填写完成后点击「保存配置」，再点右下角「同意」继续安装。</p>
-      <div class="field">
-        <label>访问 Token <span style="color:#c0392b">*</span></label>
-        <input type="text" id="token" value="my-secret-token" autocomplete="off" spellcheck="false">
-        <div class="hint">建议修改为随机字符串，至少 6 位。</div>
+      <h2>安装须知</h2>
+      <div class="highlight">
+        <strong>点击「同意」后，将弹出对话框让你输入：</strong>
+        <ul>
+          <li>访问 Token（API 认证密钥）</li>
+          <li>AES 加密密钥（消息加密，两端需一致）</li>
+          <li>监听端口（默认 8000）</li>
+        </ul>
       </div>
-      <div class="field">
-        <label>监听端口</label>
-        <input type="number" id="port" value="8000" min="1024" max="65535">
-        <div class="hint">范围 1024 ~ 65535，默认 8000。</div>
-      </div>
-      <button id="save-btn" onclick="save()">保存配置</button>
-      <div id="msg"></div>
-      <hr>
-      <div class="note">
-        安装后可随时通过菜单栏图标修改，或直接编辑：<br>
-        <code>sudo nano /Library/LaunchDaemons/com.shellagent.plist</code>
-      </div>
-    <script>
-    function save() {
-      var token = document.getElementById('token').value.trim();
-      var port  = document.getElementById('port').value.trim();
-      var msg   = document.getElementById('msg');
-      var btn   = document.getElementById('save-btn');
-      if (!token || token.length < 6) { msg.className='err'; msg.textContent='⚠ Token 不能少于 6 个字符'; return; }
-      var p = parseInt(port, 10);
-      if (isNaN(p) || p < 1024 || p > 65535) { msg.className='err'; msg.textContent='⚠ 端口号请填 1024 ~ 65535'; return; }
-      token = token.replace(/[\\/\\n\\r]/g, '');
-      var cmd = 'printf "TOKEN=' + token + '\\\\nPORT=' + p + '\\\\n" > /private/tmp/shellagent_install.conf';
-      try {
-        system.run('/bin/bash', '-c', cmd);
-        msg.className='ok'; msg.textContent='✓ 已保存，请点击右下角「同意」继续';
-        btn.textContent='✓ 已保存'; btn.classList.add('saved'); btn.disabled=true;
-      } catch(e) {
-        msg.className='ok'; msg.textContent='✓ 点击「同意」继续（安装后可手动修改）';
-        btn.textContent='✓ 已确认'; btn.classList.add('saved'); btn.disabled=true;
-      }
-    }
-    </script>
+      <p>安装完成后，可随时通过以下方式修改配置：</p>
+      <p><code>sudo nano /Library/LaunchDaemons/com.shellagent.plist</code></p>
     </body></html>
 """)
 
