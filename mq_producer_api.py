@@ -40,7 +40,8 @@ import pika
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+from typing import Annotated
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives import padding as aes_padding
 from cryptography.hazmat.backends import default_backend
@@ -132,7 +133,7 @@ class CommandTask(Base):
     timeout      = Column(Integer,     default=30)
     reply_to     = Column(String(128), nullable=True)
     status       = Column(
-        Enum("pending", "sent", "failed", name="task_status"),
+        Enum("pending", "sending", "sent", "failed", name="task_status"),
         default="pending", index=True
     )
     cmd_id       = Column(String(36),  nullable=True)
@@ -354,16 +355,35 @@ def poll_and_send():
     failed_count = 0
     try:
         now   = datetime.datetime.now()
-        tasks = (
-            session.query(CommandTask)
+        # 不使用 SKIP LOCKED（MySQL 5.7.6 以下不支持）
+        # 先查 ID 列表，再批量占位 pending→sending，防止多实例重复发送
+        task_ids = [r[0] for r in (
+            session.query(CommandTask.id)
             .filter(
                 CommandTask.status == "pending",
                 CommandTask.retry_count < CommandTask.max_retries,
                 (CommandTask.scheduled_at == None) | (CommandTask.scheduled_at <= now),
             )
-            .with_for_update(skip_locked=True)
             .order_by(CommandTask.created_at)
             .limit(100)
+            .all()
+        )]
+
+        if not task_ids:
+            log.info("   无待发任务")
+            return
+
+        # 批量占位，防并发重复
+        session.query(CommandTask).filter(
+            CommandTask.id.in_(task_ids),
+            CommandTask.status == "pending",
+        ).update({"status": "sending"}, synchronize_session="fetch")
+        session.commit()
+
+        tasks = (
+            session.query(CommandTask)
+            .filter(CommandTask.id.in_(task_ids), CommandTask.status == "sending")
+            .order_by(CommandTask.created_at)
             .all()
         )
 
@@ -391,6 +411,7 @@ def poll_and_send():
                     task.status = "failed"
                     log.error(f"   ✗ 达到最大重试次数  id={task.id}  err={e}")
                 else:
+                    task.status = "pending"  # 回退，等待下次轮询重试
                     log.warning(
                         f"   ✗ 发送失败（第 {task.retry_count} 次）"
                         f"  id={task.id}  将重试  err={e}"
@@ -414,33 +435,27 @@ scheduler = BackgroundScheduler(timezone="Asia/Shanghai")
 # ══════════════════════════════════════════════════════════════
 
 class KeyRegisterRequest(BaseModel):
-    user_id:    str = Field(..., min_length=1, description="用户ID", example="user123")
-    secret_key: str = Field(..., min_length=6, description="App 端输入的原始密钥（至少 6 位）", example="MyP@ssw0rd!")
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "user_id":    "user123",
                 "secret_key": "MyP@ssw0rd!",
             }
         }
+    )
+
+    user_id:    str = Field(..., min_length=1, description="用户ID")
+    secret_key: str = Field(..., min_length=6, description="App 端输入的原始密钥（至少 6 位）")
 
 
 class KeyVerifyRequest(BaseModel):
-    user_id:    str = Field(..., description="用户ID",       example="user123")
-    secret_key: str = Field(..., description="待验证的原始密钥", example="MyP@ssw0rd!")
+    user_id:    str = Field(..., description="用户ID")
+    secret_key: str = Field(..., description="待验证的原始密钥")
 
 
 class SendRequest(BaseModel):
-    user_id:      str           = Field(...,  description="目标用户ID，命令发到 agent.{user_id} 队列", example="user123")
-    command:      str           = Field(...,  description="待执行的 Shell 命令", example="df -h")
-    timeout:      int           = Field(30,   description="命令超时秒数", ge=1, le=300, example=30)
-    reply_to:     Optional[str] = Field(None, description="结果回写队列，默认 result.{user_id}")
-    scheduled_at: Optional[str] = Field(None, description="计划执行时间（ISO8601），空=立即执行")
-    max_retries:  int           = Field(3,    description="最大重试次数", ge=0, le=10)
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "user_id":      "user123",
                 "command":      "ls -la ~/Desktop",
@@ -450,13 +465,19 @@ class SendRequest(BaseModel):
                 "max_retries":  3,
             }
         }
+    )
+
+    user_id:      str           = Field(...,  description="目标用户ID，命令发到 agent.{user_id} 队列")
+    command:      str           = Field(...,  description="待执行的 Shell 命令")
+    timeout:      int           = Field(30,   description="命令超时秒数", ge=1, le=300)
+    reply_to:     Optional[str] = Field(None, description="结果回写队列，默认 result.{user_id}")
+    scheduled_at: Optional[str] = Field(None, description="计划执行时间（ISO8601），空=立即执行")
+    max_retries:  int           = Field(3,    description="最大重试次数", ge=0, le=10)
 
 
 class BatchSendRequest(BaseModel):
-    commands: list[SendRequest] = Field(..., max_length=50, description="命令列表，最多 50 条")
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "commands": [
                     {"user_id": "user123", "command": "df -h",       "timeout": 30},
@@ -465,6 +486,9 @@ class BatchSendRequest(BaseModel):
                 ]
             }
         }
+    )
+
+    commands: Annotated[list[SendRequest], Field(max_length=50)] = Field(..., description="命令列表，最多 50 条")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1067,6 +1091,7 @@ async def gen_key(x_token: str = Header(...)):
 
 if __name__ == "__main__":
     import sys
+    import asyncio
 
     if "--init-db" in sys.argv:
         init_db()
@@ -1075,4 +1100,7 @@ if __name__ == "__main__":
     if not AES_KEY_B64:
         log.info("提示：未配置全局 AES_KEY，所有用户需先调用 POST /key/register 注册专属密钥")
 
-    uvicorn.run(app, host=API_HOST, port=API_PORT, log_level="warning")
+    # 兼容 Python 3.13 + PyCharm 调试器，避免 loop_factory 冲突
+    config = uvicorn.Config(app, host=API_HOST, port=API_PORT, log_level="warning")
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())

@@ -169,7 +169,7 @@ if __name__ == "__main__":
     parser.add_argument("--user",    required=True,  help="目标用户ID")
     parser.add_argument("--cmd",     required=True,  help="要执行的 shell 命令")
     parser.add_argument("--key",     default=os.getenv("AES_KEY", ""), help="AES-256 密钥 base64")
-    parser.add_argument("--host",    default=os.getenv("MQ_HOST", "localhost"))
+    parser.add_argument("--host",    default=os.getenv("MQ_HOST", "10.17.1.17"))
     parser.add_argument("--port",    default=int(os.getenv("MQ_PORT", "5672")), type=int)
     parser.add_argument("--mq-user", default=os.getenv("MQ_USER", "guest"))
     parser.add_argument("--mq-pass", default=os.getenv("MQ_PASS", "guest"))

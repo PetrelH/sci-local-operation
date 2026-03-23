@@ -18,7 +18,6 @@ Shell Agent — 菜单栏管理 App
 
 import rumps
 import subprocess
-import threading
 import webbrowser
 import os
 import time
@@ -144,11 +143,8 @@ class ShellAgentApp(rumps.App):
     # ── 快捷操作 ──────────────────────────────────────────────
     @rumps.clicked("🌐  打开控制台")
     def open_console(self, _):
-        # 优先打开本地 console.html，其次打 HTTP
-        if os.path.exists(WEB_DIR):
-            subprocess.run(["open", WEB_DIR])
-        else:
-            webbrowser.open(f"http://localhost:{PORT}")
+        # 统一通过 HTTP 访问，避免 file:// 权限问题
+        webbrowser.open(f"http://localhost:{PORT}/console")
 
     @rumps.clicked("📋  查看日志")
     def open_log(self, _):

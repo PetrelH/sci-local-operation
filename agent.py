@@ -11,8 +11,8 @@ macOS 本地 Shell Agent
 
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse
+from pydantic import BaseModel, Field, ConfigDict
 import subprocess
 import uvicorn
 import asyncio
@@ -21,6 +21,7 @@ import os
 import platform
 import datetime
 import sys
+import pathlib
 
 # ─── 配置 ────────────────────────────────────────────────────
 TOKEN = os.getenv("AGENT_TOKEN", "my-secret-token")
@@ -72,14 +73,8 @@ def is_permission_error(stdout: str, stderr: str) -> bool:
 
 
 def sudo_retry(command: str, timeout: int) -> dict:
-    """
-    用 osascript 弹出系统密码框，以 sudo 权限重新执行命令。
-    返回和普通执行相同结构的 dict。
-    """
     safe_cmd = command.replace("\\", "\\\\").replace('"', '\\"').replace("'", "'\\''")
     safe_cwd = _cwd.replace("'", "'\\''")
-
-    # osascript 弹出授权对话框并用 sudo 执行
     apple_script = f'''
 do shell script "cd '{safe_cwd}' && {safe_cmd}" with administrator privileges
 '''
@@ -105,22 +100,10 @@ do shell script "cd '{safe_cwd}' && {safe_cmd}" with administrator privileges
 
 # ─── App ─────────────────────────────────────────────────────
 tags_metadata = [
-    {
-        "name": "命令执行",
-        "description": "在本地 macOS 执行 Shell 命令，支持同步返回和流式 SSE 两种模式。",
-    },
-    {
-        "name": "工作目录",
-        "description": "查询和设置持久化工作目录，`cd` 命令跨请求保持状态。",
-    },
-    {
-        "name": "权限授权",
-        "description": "处理 `Operation not permitted` 类权限问题，引导开启完整磁盘访问权限。",
-    },
-    {
-        "name": "系统信息",
-        "description": "查询本机系统信息和服务健康状态。",
-    },
+    {"name": "命令执行",  "description": "在本地 macOS 执行 Shell 命令，支持同步返回和流式 SSE 两种模式。"},
+    {"name": "工作目录",  "description": "查询和设置持久化工作目录，`cd` 命令跨请求保持状态。"},
+    {"name": "权限授权",  "description": "处理 `Operation not permitted` 类权限问题。"},
+    {"name": "系统信息",  "description": "查询本机系统信息和服务健康状态。"},
 ]
 
 app = FastAPI(
@@ -136,12 +119,6 @@ app = FastAPI(
 ```
 x-token: <your-token>
 ```
-
-### 特性
-- ✅ 持久化工作目录，`cd` 跨命令保持状态
-- ✅ 流式输出（SSE），适合长时间运行的命令
-- ✅ 权限不足时自动弹出 macOS 授权框
-- ✅ 命令黑名单保护
 """,
     openapi_tags=tags_metadata,
     docs_url="/docs",
@@ -156,21 +133,52 @@ app.add_middleware(
 )
 
 
-# ─── 模型 ─────────────────────────────────────────────────────
-class CmdRequest(BaseModel):
-    command: str  = Field(...,  description="要执行的 Shell 命令", example="ls -la ~/Desktop")
-    timeout: int  = Field(30,   description="最长执行秒数（1~300）", ge=1, le=300, example=30)
-    stream:  bool = Field(False, description="是否流式返回（/exec/stream 专用）", example=False)
-    sudo_on_permission_error: bool = Field(False, description="遇到权限错误时通过 osascript 弹出系统密码框重试", example=False)
+# ─── Web 控制台（HTTP 提供，避免 file:// 被浏览器拒绝）────────
+_CONSOLE_CANDIDATES = [
+    pathlib.Path("/usr/local/share/shellagent/console.html"),
+    pathlib.Path(__file__).parent / "console.html",
+]
+if getattr(sys, "frozen", False):
+    _CONSOLE_CANDIDATES.insert(0, pathlib.Path(sys._MEIPASS) / "console.html")
 
-    class Config:
-        json_schema_extra = {
+
+def _find_console() -> pathlib.Path | None:
+    for p in _CONSOLE_CANDIDATES:
+        if p and p.exists():
+            return p
+    return None
+
+
+@app.get("/console", response_class=HTMLResponse, include_in_schema=False)
+async def serve_console():
+    """通过 HTTP 返回 console.html，避免 file:// 权限问题。"""
+    p = _find_console()
+    if p is None:
+        raise HTTPException(status_code=404, detail="console.html 未找到")
+    return HTMLResponse(content=p.read_text(encoding="utf-8"))
+
+
+@app.get("/", include_in_schema=False)
+async def root_redirect():
+    return RedirectResponse(url="/console")
+
+
+# ─── 模型（Pydantic V2 写法）─────────────────────────────────
+class CmdRequest(BaseModel):
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
-                "command": "cat ~/Desktop/备份sql/feishu.sql",
+                "command": "cat ~/Desktop/test.txt",
                 "timeout": 30,
                 "sudo_on_permission_error": True,
             }
         }
+    )
+
+    command:                  str  = Field(...,  description="要执行的 Shell 命令")
+    timeout:                  int  = Field(30,   description="最长执行秒数（1~300）", ge=1, le=300)
+    stream:                   bool = Field(False, description="是否流式返回（/exec/stream 专用）")
+    sudo_on_permission_error: bool = Field(False, description="遇到权限错误时通过 osascript 弹出系统密码框重试")
 
 
 # ─── 工具函数 ─────────────────────────────────────────────────
@@ -203,19 +211,14 @@ def build_command(command: str) -> str:
 
 # ─── 路由 ─────────────────────────────────────────────────────
 
-@app.get(
-    "/",
-    tags=["系统信息"],
-    summary="健康检查",
-    response_description="服务状态、平台信息和当前工作目录",
-)
+@app.get("/health", tags=["系统信息"], summary="健康检查")
 async def health():
     return {
-        "status": "ok",
+        "status":   "ok",
         "platform": platform.system(),
-        "python": sys.version,
-        "time": datetime.datetime.now().isoformat(),
-        "cwd": get_cwd(),
+        "python":   sys.version,
+        "time":     datetime.datetime.now().isoformat(),
+        "cwd":      get_cwd(),
     }
 
 
@@ -223,37 +226,13 @@ async def health():
     "/exec",
     tags=["命令执行"],
     summary="执行命令（同步）",
-    response_description="命令的 stdout、stderr、返回码和耗时",
     responses={
-        200: {
-            "description": "执行成功",
-            "content": {
-                "application/json": {
-                    "example": {
-                        "stdout": "total 0\ndrwxr-xr-x  2 user staff  64 Jan 1 00:00 .\n",
-                        "stderr": "",
-                        "returncode": 0,
-                        "duration_ms": 42,
-                        "command": "ls -la",
-                        "cwd": "/Users/user",
-                        "sudo_used": False,
-                        "permission_error": False,
-                    }
-                }
-            },
-        },
         401: {"description": "Token 错误"},
         403: {"description": "命令被黑名单拦截"},
         408: {"description": "命令执行超时"},
     },
 )
 async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...)):
-    """
-    执行 Shell 命令（同步返回）
-    遇到 Operation not permitted / Permission denied 时：
-      - sudo_on_permission_error=true（默认）→ 弹出系统密码框用 sudo 重试
-      - sudo_on_permission_error=false → 直接返回错误，前端显示授权引导
-    """
     check_token(x_token)
     check_blocked(body.command)
 
@@ -278,7 +257,6 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
 
     duration_ms = int((datetime.datetime.now() - start).total_seconds() * 1000)
 
-    # ── 权限错误处理 ─────────────────────────────────────────
     sudo_used = False
     if is_permission_error(proc.stdout, proc.stderr) and body.sudo_on_permission_error:
         log("INFO", f"权限不足，弹出 sudo 授权框重试：{body.command!r}")
@@ -295,14 +273,13 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
     log("INFO", f"done rc={returncode} duration={duration_ms}ms sudo={sudo_used}")
 
     return {
-        "stdout":      stdout,
-        "stderr":      stderr,
-        "returncode":  returncode,
-        "duration_ms": duration_ms,
-        "command":     body.command,
-        "cwd":         get_cwd(),
-        "sudo_used":   sudo_used,
-        # 权限错误且未 sudo 时通知前端展示引导
+        "stdout":           stdout,
+        "stderr":           stderr,
+        "returncode":       returncode,
+        "duration_ms":      duration_ms,
+        "command":          body.command,
+        "cwd":              get_cwd(),
+        "sudo_used":        sudo_used,
         "permission_error": is_permission_error(stdout, stderr) and not sudo_used,
     }
 
@@ -311,18 +288,12 @@ async def exec_cmd(body: CmdRequest, request: Request, x_token: str = Header(...
     "/exec/stream",
     tags=["命令执行"],
     summary="执行命令（流式 SSE）",
-    response_description="Server-Sent Events 流，每行输出实时推送",
     responses={
-        200: {
-            "description": "SSE 流，每条消息格式：`data: {\"line\": \"...\"}` 或 `data: {\"done\": true, \"returncode\": 0}`",
-            "content": {"text/event-stream": {}},
-        },
         401: {"description": "Token 错误"},
         403: {"description": "命令被黑名单拦截"},
     },
 )
 async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(...)):
-    """流式执行，权限错误时在流末尾附加 permission_error 标记"""
     check_token(x_token)
     check_blocked(body.command)
 
@@ -347,7 +318,6 @@ async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(
             combined = "".join(output_buf)
             perm_err = is_permission_error(combined, "")
 
-            # 流式模式下权限错误：用 osascript sudo 重试，把结果追加输出
             if perm_err and body.sudo_on_permission_error:
                 yield f"data: {json.dumps({'line': '\n[权限不足，正在弹出授权框...]\n'})}\n\n"
                 sudo_result = sudo_retry(body.command, body.timeout)
@@ -365,28 +335,13 @@ async def exec_stream(body: CmdRequest, request: Request, x_token: str = Header(
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 
-@app.get(
-    "/cwd",
-    tags=["工作目录"],
-    summary="查询当前工作目录",
-    response_description="当前持久化工作目录路径",
-    responses={200: {"content": {"application/json": {"example": {"cwd": "/Users/user/Desktop"}}}}},
-)
+@app.get("/cwd", tags=["工作目录"], summary="查询当前工作目录")
 async def get_current_dir(x_token: str = Header(...)):
     check_token(x_token)
     return {"cwd": get_cwd()}
 
 
-@app.post(
-    "/cwd",
-    tags=["工作目录"],
-    summary="设置工作目录",
-    response_description="设置后的绝对路径",
-    responses={
-        200: {"content": {"application/json": {"example": {"cwd": "/Users/user/projects"}}}},
-        400: {"description": "目录不存在"},
-    },
-)
+@app.post("/cwd", tags=["工作目录"], summary="设置工作目录")
 async def set_current_dir(request: Request, x_token: str = Header(...)):
     check_token(x_token)
     body = await request.json()
@@ -397,34 +352,8 @@ async def set_current_dir(request: Request, x_token: str = Header(...)):
     return {"cwd": resolved}
 
 
-@app.get(
-    "/grant-access",
-    tags=["权限授权"],
-    summary="打开系统设置授权页",
-    response_description="引导步骤说明",
-    responses={
-        200: {
-            "content": {
-                "application/json": {
-                    "example": {
-                        "message": "已打开系统设置，请将 ShellAgent 加入「完整磁盘访问权限」",
-                        "steps": [
-                            "1. 找到「完整磁盘访问权限」",
-                            "2. 点击锁图标解锁",
-                            "3. 点击 + 添加 ShellAgent",
-                            "4. 重启 ShellAgent 服务",
-                        ],
-                    }
-                }
-            }
-        }
-    },
-)
+@app.get("/grant-access", tags=["权限授权"], summary="打开系统设置授权页")
 async def grant_access(x_token: str = Header(...)):
-    """
-    引导用户开启终端完整磁盘访问权限。
-    直接用 osascript 打开系统偏好设置到对应页面。
-    """
     check_token(x_token)
     script = '''
 tell application "System Preferences"
@@ -441,26 +370,20 @@ end tell
     try:
         subprocess.Popen(["osascript", "-e", script])
     except Exception:
-        # 回退：直接 open 系统设置 URL
         subprocess.Popen(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"])
 
     return {
-        "message": "已打开系统设置 → 隐私与安全性，请将你的终端或 ShellAgent 加入「完整磁盘访问权限」",
+        "message": "已打开系统设置 → 隐私与安全性",
         "steps": [
-            "1. 在打开的窗口中找到「完整磁盘访问权限」",
+            "1. 找到「完整磁盘访问权限」",
             "2. 点击左下角锁图标解锁",
-            "3. 点击 + 添加 ShellAgent 或你的终端 App",
+            "3. 点击 + 添加 ShellAgent 或终端 App",
             "4. 重启 ShellAgent 服务",
         ]
     }
 
 
-@app.get(
-    "/info",
-    tags=["系统信息"],
-    summary="查询系统信息",
-    response_description="平台、节点、处理器等系统信息",
-)
+@app.get("/info", tags=["系统信息"], summary="查询系统信息")
 async def system_info(x_token: str = Header(...)):
     check_token(x_token)
     proc = subprocess.run(
@@ -478,9 +401,13 @@ async def system_info(x_token: str = Header(...)):
     }
 
 
-# ─── 启动 ─────────────────────────────────────────────────────
+# ─── 启动（兼容 Python 3.13 + PyCharm 调试器）────────────────
 if __name__ == "__main__":
     log("INFO", f"Shell Agent starting on {HOST}:{PORT}")
-    log("INFO", f"Token: {TOKEN[:4]}{'*' * (len(TOKEN)-4)}")
+    log("INFO", f"Token: {TOKEN[:4]}{'*' * (len(TOKEN) - 4)}")
     log("INFO", f"Initial cwd: {get_cwd()}")
-    uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
+    log("INFO", f"Console: http://localhost:{PORT}/console")
+
+    config = uvicorn.Config(app, host=HOST, port=PORT, log_level="warning")
+    server = uvicorn.Server(config)
+    asyncio.run(server.serve())

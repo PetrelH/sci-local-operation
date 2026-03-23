@@ -48,10 +48,10 @@ logging.basicConfig(
 log = logging.getLogger("mq_consumer")
 
 # ─── 配置 ────────────────────────────────────────────────────
-MQ_HOST     = os.getenv("MQ_HOST",    "localhost")
+MQ_HOST     = os.getenv("MQ_HOST",    "10.17.1.17")
 MQ_PORT     = int(os.getenv("MQ_PORT", "5672"))
-MQ_USER     = os.getenv("MQ_USER",    "guest")
-MQ_PASS     = os.getenv("MQ_PASS",    "guest")
+MQ_USER     = os.getenv("MQ_USER",    "admin")
+MQ_PASS     = os.getenv("MQ_PASS",    "admin123")
 MQ_VHOST    = os.getenv("MQ_VHOST",  "/")
 USER_ID     = os.getenv("MQ_USER_ID", "")
 
